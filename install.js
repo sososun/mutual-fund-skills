@@ -43,6 +43,6 @@ const checkDep = (dep) => {
     console.log(`${colors.cyan}  pip install ${missing.join(' ')}${colors.reset}\n`);
   } else {
     console.log(`\n${colors.green}✓ 所有依赖已安装${colors.reset}`);
-    console.log(`${colors.cyan}\n现在可以运行: npx fund-screener${colors.reset}\n`);
+    console.log(`${colors.cyan}\n现在可以运行: npx mutual-fund-skills${colors.reset}\n`);
   }
 })();

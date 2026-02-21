@@ -107,35 +107,57 @@ if (args.includes('--help') || args.includes('-h')) {
 基金分析技能 - 使用方法
 
 命令:
-  npx mutual-fund-skills                    全市场智能筛选（默认200只，约20分钟）
-  npx mutual-fund-skills --max 300          指定分析数量（50-500只）
-  npx mutual-fund-skills <基金代码>         分析单个基金
-  npx mutual-fund-skills <代码> <名称>      分析单个基金（指定名称）
-  npx mutual-fund-skills --help             显示帮助信息
-  npx mutual-fund-skills --version          显示版本
+  # 基金类型筛选
+  npx mutual-fund-skills --bond                    纯债基金筛选（低风险）
+  npx mutual-fund-skills --gushou-plus            固收+专业筛选（铁三角）
+  npx mutual-fund-skills --stock                  股票类基金筛选
+  npx mutual-fund-skills --stock-alpha            专业Alpha策略筛选
+  
+  # 自定义筛选参数
+  npx mutual-fund-skills --bond --min-sharpe 1.0 --max-dd 2
+  npx mutual-fund-skills --gushou-plus --min-sortino 1.5
+  npx mutual-fund-skills --stock-alpha --min-calmar 0.8 --min-return 10
+  
+  # 数量控制
+  npx mutual-fund-skills --bond --max 50          筛选50只
+  npx mutual-fund-skills <基金代码>              分析单个基金
+  
+  # 帮助
+  npx mutual-fund-skills --help                   显示帮助信息
+  npx mutual-fund-skills --version                 显示版本
 
-功能:
-  • 全市场筛选: 从所有基金中智能筛选优质产品（默认200只）
-  • 自定义数量: 支持分析50-500只基金
-  • 单个分析: 深度分析指定基金的所有指标
-  • 智能识别: 自动排除股票型、行业主题型基金
-  • 计算夏普比率、最大回撤、年化收益
-  • 获取基金规模、股票/债券仓位、基金经理、持仓等
-  • 输出 CSV 格式结果
+筛选模式说明:
+  • --bond / --pure-bond: 纯债基金筛选（夏普>1.0 & 回撤<2%）
+  • --gushou-plus: 固收+基金筛选（夏普>0.8 & 索提诺>1.2 & 回撤<5%）
+  • --stock: 股票类基金筛选（普通模式）
+  • --stock-alpha: Alpha策略筛选（卡玛>1.2 & 收益>10%）
+
+自定义参数:
+  • --min-sharpe <value>: 最小夏普比率
+  • --max-dd <value>: 最大回撤百分比（正数，如5表示回撤<5%）
+  • --min-return <value>: 最小年化收益率
+  • --min-calmar <value>: 最小卡玛比率
+  • --min-sortino <value>: 最小索提诺比率
+  • --max <value>: 最大分析数量（50-500）
 
 示例:
-  # 全市场筛选（默认200只，约20分钟）
-  npx mutual-fund-skills
+  # 纯债基金筛选
+  npx mutual-fund-skills --bond
   
-  # 分析300只基金
-  npx mutual-fund-skills --max 300
+  # 纯债基金，自定义标准
+  npx mutual-fund-skills --bond --min-sharpe 1.0 --max-dd 2 --min-return 2.5
   
-  # 快速筛选100只
-  npx mutual-fund-skills --max 100
+  # 固收+基金筛选
+  npx mutual-fund-skills --gushou-plus
+  
+  # 股票型Alpha筛选
+  npx mutual-fund-skills --stock-alpha
 
-  # 单个基金分析
-  npx mutual-fund-skills 000215
-  npx mutual-fund-skills 000215 "广发趋势优选灵活配置混合A"
+专业指标说明:
+  • 夏普比率 (Sharpe): 风险调整收益，>0.5良好，>1.0优秀
+  • 索提诺比率 (Sortino): 只惩罚下行波动，>1.2良好，>2.0优秀（固收+核心）
+  • 卡玛比率 (Calmar): 收益/回撤，>0.8良好，>1.2优秀（股票核心）
+  • 最大回撤: 历史上最大亏损，越小越好
 
 依赖:
   • Python 3.8+
@@ -148,7 +170,7 @@ ${colors.reset}`);
 }
 
 if (args.includes('--version') || args.includes('-v')) {
-  console.log('v1.2.0');
+  console.log('v1.3.0');
   process.exit(0);
 }
 
@@ -206,18 +228,40 @@ if (args.length > 0 && !args[0].startsWith('--')) {
     
     const scriptPath = path.join(__dirname, 'fund_screener.py');
     
-    // 构建参数
+    // 构建参数 - 透传所有支持的参数给 Python
     const pythonArgs = [scriptPath];
-    
-    // 如果有 --max 参数，传递给 Python
-    if (args.includes('--max')) {
-      const idx = args.indexOf('--max');
-      if (idx + 1 < args.length) {
-        pythonArgs.push('--max', args[idx + 1]);
+
+    // 透传带值的参数
+    const valueArgs = ['--max', '--min-sharpe', '--max-dd', '--min-return', '--min-calmar', '--min-sortino'];
+    for (const argName of valueArgs) {
+      if (args.includes(argName)) {
+        const idx = args.indexOf(argName);
+        if (idx + 1 < args.length) {
+          pythonArgs.push(argName, args[idx + 1]);
+        }
       }
     }
-    
-    console.log(`${colors.yellow}启动全市场基金智能筛选...${colors.reset}\n`);
+
+    // 透传开关参数
+    const flagArgs = ['--gushou-plus', '--stock', '--stock-alpha', '--bond', '--pure-bond'];
+    for (const flag of flagArgs) {
+      if (args.includes(flag)) {
+        pythonArgs.push(flag);
+      }
+    }
+
+    // 显示模式提示
+    if (args.includes('--bond') || args.includes('--pure-bond')) {
+      console.log(`${colors.yellow}启动纯债基金筛选...${colors.reset}\n`);
+    } else if (args.includes('--gushou-plus')) {
+      console.log(`${colors.yellow}启动固收+基金专业筛选...${colors.reset}\n`);
+    } else if (args.includes('--stock-alpha')) {
+      console.log(`${colors.yellow}启动专业Alpha策略筛选...${colors.reset}\n`);
+    } else if (args.includes('--stock')) {
+      console.log(`${colors.yellow}启动股票类基金智能筛选...${colors.reset}\n`);
+    } else {
+      console.log(`${colors.yellow}启动全市场基金智能筛选...${colors.reset}\n`);
+    }
     
     const pythonCmd = pythonVersion === 'python' ? 'python' : 'python3';
     const child = spawn(pythonCmd, pythonArgs, {

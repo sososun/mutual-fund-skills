@@ -9,11 +9,19 @@ import pandas as pd
 import numpy as np
 import warnings
 import time
+from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Tuple
 warnings.filterwarnings('ignore')
 
-# 默认无风险利率（年化）
-RISK_FREE_RATE = 0.025
+# 默认无风险利率（年化），参考当前10年期国债收益率水平
+# 更新日期: 2025-02，中国10年期国债收益率约1.6%-1.8%
+RISK_FREE_RATE = 0.018
+
+# 默认指标计算窗口（交易日数），约3年
+METRICS_WINDOW_DAYS = 756
+
+# 共享缓存：fund_manager_em 数据（避免 get_fund_scale 和 get_fund_manager_info 各自独立请求）
+_manager_cache = {'data': None, 'time': 0}
 
 
 def calculate_sharpe_ratio(returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> float:
@@ -70,39 +78,219 @@ def calculate_annualized_return(nav_values: pd.Series, days: int = 252) -> float
     return (1 + total_return) ** (1 / n_years) - 1
 
 
-def get_fund_metrics(fund_code: str, fund_name: str, min_days: int = 500) -> Optional[Dict]:
+def calculate_calmar_ratio(annual_return: float, max_drawdown: float) -> float:
     """
-    获取基金风险指标
+    计算卡玛比率 (Calmar Ratio)
     
+    公式：年化收益率 / |最大回撤|
+    用于评估收益与回撤的平衡，值越大越好
+    
+    Args:
+        annual_return: 年化收益率（小数）
+        max_drawdown: 最大回撤（负数，如-0.15）
+    
+    Returns:
+        卡玛比率
+    """
+    if max_drawdown >= 0 or abs(max_drawdown) < 0.001:
+        return np.nan
+    return annual_return / abs(max_drawdown)
+
+
+def calculate_sortino_ratio(returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> float:
+    """
+    计算索提诺比率 (Sortino Ratio)
+
+    公式：(年化收益 - 无风险利率) / 下行偏差(DD)
+    下行偏差：DD = sqrt( (1/N) * Σ min(0, r_i - MAR)^2 ) * sqrt(252)
+    其中 MAR = 最小可接受收益率（日化无风险利率）
+
+    与夏普比率的区别：只惩罚低于MAR的波动，不惩罚上行波动
+    更适合评估固收+基金（投资者喜欢上涨，只厌恶下跌）
+
+    Args:
+        returns: 日收益率序列
+        risk_free_rate: 无风险利率（年化）
+
+    Returns:
+        索提诺比率，值越大越好
+    """
+    if len(returns) < 2:
+        return np.nan
+
+    # 最小可接受收益率（日化）
+    mar_daily = risk_free_rate / 252
+
+    # 年化收益率
+    annual_return = returns.mean() * 252
+
+    # 下行偏差（Downside Deviation）：对全部交易日计算
+    downside_diff = np.minimum(0, returns.values - mar_daily)
+    downside_deviation = np.sqrt(np.mean(downside_diff ** 2)) * np.sqrt(252)
+
+    if downside_deviation == 0:
+        return np.nan
+
+    # 索提诺比率
+    excess_return = annual_return - risk_free_rate
+    return excess_return / downside_deviation
+
+
+def calculate_information_ratio(returns: pd.Series, benchmark_returns: pd.Series) -> float:
+    """
+    计算信息比率 (Information Ratio)
+    
+    公式：超额收益 / 跟踪误差
+    衡量基金经理相对于基准的超额收益能力
+    
+    Args:
+        returns: 基金日收益率序列
+        benchmark_returns: 基准指数日收益率序列
+    
+    Returns:
+        信息比率，>0.5表示有稳定的超额收益能力
+    """
+    if len(returns) < 2 or len(benchmark_returns) < 2:
+        return np.nan
+    
+    # 计算超额收益
+    excess_returns = returns - benchmark_returns
+    
+    # 跟踪误差（年化）
+    tracking_error = excess_returns.std() * np.sqrt(252)
+    
+    if tracking_error == 0:
+        return np.nan
+    
+    # 信息比率
+    return excess_returns.mean() * 252 / tracking_error
+
+
+def calculate_style_drift_score(holdings_history: List[Dict]) -> float:
+    """
+    计算风格漂移分数
+    
+    通过分析历史持仓的行业集中度变化来评估风格一致性
+    分数越低表示风格越稳定
+    
+    Args:
+        holdings_history: 历史持仓数据列表
+    
+    Returns:
+        风格漂移分数（0-1之间，越小越好）
+    """
+    if len(holdings_history) < 3:
+        return 0.5  # 数据不足，返回中等分数
+    
+    try:
+        # 计算每个报告期的行业集中度（前3大行业占比）
+        concentrations = []
+        for holding in holdings_history:
+            if '行业分布' in holding:
+                industries = holding['行业分布']
+                if len(industries) > 0:
+                    top3_ratio = sum(sorted(industries.values(), reverse=True)[:3])
+                    concentrations.append(top3_ratio)
+        
+        if len(concentrations) < 3:
+            return 0.5
+        
+        # 计算集中度的标准差（变异系数）
+        mean_conc = np.mean(concentrations)
+        std_conc = np.std(concentrations)
+        
+        if mean_conc == 0:
+            return 0.5
+        
+        cv = std_conc / mean_conc
+        # 归一化到0-1范围
+        drift_score = min(1.0, cv / 0.5)
+        
+        return drift_score
+    except Exception:
+        return 0.5
+
+
+def _find_nav_by_date(df: pd.DataFrame, target_date: datetime, date_col: str = '净值日期', nav_col: str = '单位净值') -> Optional[float]:
+    """
+    按日期查找最近的净值，向前查找最近的交易日
+
+    Args:
+        df: 含净值日期和单位净值的DataFrame（需已排序）
+        target_date: 目标日期
+        date_col: 日期列名
+        nav_col: 净值列名
+
+    Returns:
+        最近交易日的净值，找不到返回None
+    """
+    mask = df[date_col] <= target_date
+    if mask.any():
+        return df.loc[mask, nav_col].iloc[-1]
+    return None
+
+
+def _calc_period_return(df: pd.DataFrame, years: float, date_col: str = '净值日期', nav_col: str = '单位净值') -> Optional[float]:
+    """
+    计算近N年的年化收益率（按日期，CAGR）
+
+    Args:
+        df: 含净值日期和单位净值的DataFrame（需已按日期升序排序）
+        years: 年数（如1, 2, 3）
+        date_col: 日期列名
+        nav_col: 净值列名
+
+    Returns:
+        年化收益率(%)，数据不足返回None
+    """
+    if len(df) < 2:
+        return None
+    latest_date = df[date_col].iloc[-1]
+    target_date = latest_date - timedelta(days=int(years * 365))
+    start_nav = _find_nav_by_date(df, target_date, date_col, nav_col)
+    if start_nav is None or start_nav <= 0:
+        return None
+    end_nav = df[nav_col].iloc[-1]
+    if years <= 1:
+        # 不满1年用简单收益
+        return (end_nav / start_nav - 1) * 100
+    return ((end_nav / start_nav) ** (1 / years) - 1) * 100
+
+
+def get_fund_metrics(fund_code: str, fund_name: str, min_days: int = 750) -> Optional[Dict]:
+    """
+    获取基金风险指标（基于近3年数据）
+
     Args:
         fund_code: 基金代码
         fund_name: 基金名称
-        min_days: 最小数据天数要求
-    
+        min_days: 最小数据天数要求（默认750，约3年交易日）
+
     Returns:
         包含各项指标的字典，失败返回 None
     """
     try:
         df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
-        
+
         if df is None or len(df) < min_days:
             return None
-            
+
         df['净值日期'] = pd.to_datetime(df['净值日期'])
         df = df.sort_values('净值日期')
         df['日收益率'] = df['单位净值'].pct_change()
-        
-        returns = df['日收益率'].dropna()
+
+        # 使用近3年窗口计算核心指标（数据不足3年则用全部）
+        window_df = df.tail(METRICS_WINDOW_DAYS)
+        returns = window_df['日收益率'].dropna()
         sharpe = calculate_sharpe_ratio(returns)
-        max_dd = calculate_max_drawdown(df['单位净值'])
-        annual_return = calculate_annualized_return(df['单位净值'])
+        max_dd = calculate_max_drawdown(window_df['单位净值'])
+        annual_return = calculate_annualized_return(window_df['单位净值'])
         volatility = returns.std() * np.sqrt(252)
-        
-        # 计算各期收益
-        nav_now = df['单位净值'].iloc[-1]
-        return_1y = (nav_now / df['单位净值'].iloc[-252] - 1) * 100 if len(df) >= 252 else None
-        return_2y = (nav_now / df['单位净值'].iloc[-504] - 1) * 100 / 2 if len(df) >= 504 else None
-        
+
+        # 按日期计算各期收益（CAGR）
+        return_1y = _calc_period_return(df, 1)
+        return_2y = _calc_period_return(df, 2)
+
         return {
             '基金代码': fund_code,
             '基金名称': fund_name,
@@ -110,8 +298,8 @@ def get_fund_metrics(fund_code: str, fund_name: str, min_days: int = 500) -> Opt
             '最大回撤(%)': round(max_dd * 100, 2) if not np.isnan(max_dd) else None,
             '年化收益率(%)': round(annual_return * 100, 2) if not np.isnan(annual_return) else None,
             '年化波动率(%)': round(volatility * 100, 2) if not np.isnan(volatility) else None,
-            '近1年收益(%)': round(return_1y, 2) if return_1y else None,
-            '近2年年化(%)': round(return_2y, 2) if return_2y else None,
+            '近1年收益(%)': round(return_1y, 2) if return_1y is not None else None,
+            '近2年年化(%)': round(return_2y, 2) if return_2y is not None else None,
             '数据天数': len(df)
         }
     except Exception as e:
@@ -129,23 +317,18 @@ def get_fund_scale(fund_code: str) -> Dict:
         包含基金规模的字典
     """
     try:
-        # 缓存机制避免重复请求
-        if not hasattr(get_fund_scale, 'manager_cache'):
-            get_fund_scale.manager_cache = None
-            get_fund_scale.cache_time = 0
-        
         import time as time_module
-        if get_fund_scale.manager_cache is None or time_module.time() - get_fund_scale.cache_time > 600:
-            get_fund_scale.manager_cache = ak.fund_manager_em()
-            get_fund_scale.cache_time = time_module.time()
-        
-        mgr_df = get_fund_scale.manager_cache
+        if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
+            _manager_cache['data'] = ak.fund_manager_em()
+            _manager_cache['time'] = time_module.time()
+
+        mgr_df = _manager_cache['data']
         fund_info = mgr_df[mgr_df['现任基金代码'] == fund_code]
-        
+
         if len(fund_info) > 0:
             scale_str = fund_info.iloc[0]['现任基金资产总规模']
             return {'基金规模(亿元)': scale_str}
-    except:
+    except Exception:
         pass
     return {'基金规模(亿元)': None}
 
@@ -175,7 +358,7 @@ def get_fund_asset_allocation(fund_code: str) -> Dict:
                 '估算债券仓位(%)': round(bond_ratio, 1),
                 '报告期': latest_quarter
             }
-    except:
+    except Exception:
         pass
     return {'股票仓位(%)': None, '估算债券仓位(%)': None, '报告期': None}
 
@@ -237,10 +420,10 @@ def analyze_funds(fund_list: List[Tuple[str, str, str]],
     return df
 
 
-def filter_quality_funds(df: pd.DataFrame, 
-                         min_sharpe: float = 0.3,
-                         max_drawdown: float = -25,
-                         min_return: float = 2) -> pd.DataFrame:
+def filter_quality_funds(df: pd.DataFrame,
+                         min_sharpe: float = 0.5,
+                         max_drawdown: float = -15,
+                         min_return: float = 3) -> pd.DataFrame:
     """
     筛选优质基金
     
@@ -352,18 +535,14 @@ def get_default_fund_pool() -> List[Tuple[str, str, str]]:
 def get_fund_manager_info(fund_code: str) -> Dict:
     """获取基金经理信息"""
     try:
-        if not hasattr(get_fund_manager_info, 'manager_cache'):
-            get_fund_manager_info.manager_cache = None
-            get_fund_manager_info.cache_time = 0
-        
         import time as time_module
-        if get_fund_manager_info.manager_cache is None or time_module.time() - get_fund_manager_info.cache_time > 600:
-            get_fund_manager_info.manager_cache = ak.fund_manager_em()
-            get_fund_manager_info.cache_time = time_module.time()
-        
-        mgr_df = get_fund_manager_info.manager_cache
+        if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
+            _manager_cache['data'] = ak.fund_manager_em()
+            _manager_cache['time'] = time_module.time()
+
+        mgr_df = _manager_cache['data']
         fund_info = mgr_df[mgr_df['现任基金代码'] == fund_code]
-        
+
         if len(fund_info) > 0:
             info = fund_info.iloc[0]
             years = int(info['累计从业时间']) / 365
@@ -374,7 +553,7 @@ def get_fund_manager_info(fund_code: str) -> Dict:
                 '管理规模': f"{info['现任基金资产总规模']}亿元",
                 '最佳回报': f"{info['现任基金最佳回报']}%"
             }
-    except:
+    except Exception:
         pass
     return {}
 
@@ -396,7 +575,7 @@ def get_fund_holding(fund_code: str) -> Dict:
                 '股票仓位': f"{stock_ratio:.1f}%",
                 '前10大重仓': latest_hold.head(10)[['股票代码', '股票名称', '占净值比例']].to_dict('records')
             }
-    except:
+    except Exception:
         pass
     return {}
 
@@ -412,33 +591,53 @@ def analyze_single_fund(fund_code: str, fund_name: Optional[str] = None) -> Dict
     Returns:
         完整的基金分析报告字典
     """
+    # 获取基金列表信息（同时用于查名称和最新净值，避免重复请求）
+    fund_list = None
+    try:
+        fund_list = ak.fund_open_fund_daily_em()
+    except Exception:
+        pass
+
     # 如果未提供基金名称，尝试查找
     if fund_name is None:
-        try:
-            fund_list = ak.fund_open_fund_daily_em()
+        if fund_list is not None:
             info = fund_list[fund_list['基金代码'] == fund_code]
             if len(info) > 0:
                 fund_name = info.iloc[0]['基金简称']
             else:
                 fund_name = fund_code
-        except:
+        else:
             fund_name = fund_code
-    
+
     # 获取最新净值信息
     try:
-        fund_list = ak.fund_open_fund_daily_em()
-        info = fund_list[fund_list['基金代码'] == fund_code]
+        if fund_list is not None:
+            info = fund_list[fund_list['基金代码'] == fund_code]
+        else:
+            info = pd.DataFrame()
         if len(info) > 0:
-            latest_nav = info.iloc[0].get('2026-02-13-单位净值', 'N/A')
-            accum_nav = info.iloc[0].get('2026-02-13-累计净值', 'N/A')
+            # 动态获取最新的净值日期列
+            # 查找包含"单位净值"的列
+            nav_columns = [col for col in info.columns if '单位净值' in col and '累计' not in col]
+            accum_columns = [col for col in info.columns if '累计净值' in col]
+            
+            # 获取最新净值（取第一个匹配的列）
+            latest_nav = info.iloc[0].get(nav_columns[0], 'N/A') if nav_columns else 'N/A'
+            accum_nav = info.iloc[0].get(accum_columns[0], 'N/A') if accum_columns else 'N/A'
+            
+            # 提取日期（从列名中）
+            latest_date = nav_columns[0].split('-单位净值')[0] if nav_columns else '未知日期'
+            
             daily_change = info.iloc[0].get('日增长率', 'N/A')
             fee = info.iloc[0].get('手续费', 'N/A')
             purchase_status = info.iloc[0].get('申购状态', 'N/A')
             redeem_status = info.iloc[0].get('赎回状态', 'N/A')
         else:
             latest_nav = accum_nav = daily_change = fee = purchase_status = redeem_status = 'N/A'
-    except:
+            latest_date = '未知日期'
+    except Exception as e:
         latest_nav = accum_nav = daily_change = fee = purchase_status = redeem_status = 'N/A'
+        latest_date = '未知日期'
     
     # 获取历史数据用于计算各项指标
     try:
@@ -447,37 +646,50 @@ def analyze_single_fund(fund_code: str, fund_name: Optional[str] = None) -> Dict
             df['净值日期'] = pd.to_datetime(df['净值日期'])
             df = df.sort_values('净值日期')
             df['日收益率'] = df['单位净值'].pct_change()
-            
-            # 计算风险指标
-            returns = df['日收益率'].dropna()
+
+            # 使用近3年窗口计算核心指标
+            window_df = df.tail(METRICS_WINDOW_DAYS)
+            returns = window_df['日收益率'].dropna()
             sharpe = calculate_sharpe_ratio(returns)
-            max_dd = calculate_max_drawdown(df['单位净值'])
-            annual_return = calculate_annualized_return(df['单位净值'])
+            max_dd = calculate_max_drawdown(window_df['单位净值'])
+            annual_return = calculate_annualized_return(window_df['单位净值'])
             volatility = returns.std() * np.sqrt(252)
-            
-            # 计算阶段收益
-            nav_now = df['单位净值'].iloc[-1]
+
+            # 按日期计算阶段收益
             periods = {}
-            if len(df) >= 252:
-                periods['近1年'] = round((nav_now / df['单位净值'].iloc[-252] - 1) * 100, 2)
-            if len(df) >= 504:
-                periods['近2年'] = round((nav_now / df['单位净值'].iloc[-504] - 1) * 100 / 2, 2)
-            if len(df) >= 756:
-                periods['近3年'] = round((nav_now / df['单位净值'].iloc[-756] - 1) * 100 / 3, 2)
-            
-            # 年度收益
+            r1 = _calc_period_return(df, 1)
+            if r1 is not None:
+                periods['近1年'] = round(r1, 2)
+            r2 = _calc_period_return(df, 2)
+            if r2 is not None:
+                periods['近2年年化'] = round(r2, 2)
+            r3 = _calc_period_return(df, 3)
+            if r3 is not None:
+                periods['近3年年化'] = round(r3, 2)
+
+            # 年度收益（用上年末净值作为起始值）
             df['年份'] = df['净值日期'].dt.year
             annual_returns = {}
-            for year in sorted(df['年份'].unique())[-5:]:
+            years_sorted = sorted(df['年份'].unique())
+            for i, year in enumerate(years_sorted):
+                if year not in [y for y in years_sorted[-5:]]:
+                    continue
                 year_df = df[df['年份'] == year]
                 if len(year_df) > 50:
-                    year_return = (year_df['单位净值'].iloc[-1] / year_df['单位净值'].iloc[0] - 1) * 100
+                    # 用上年末净值（如果有的话）
+                    if i > 0:
+                        prev_year_df = df[df['年份'] == years_sorted[i - 1]]
+                        start_nav = prev_year_df['单位净值'].iloc[-1]
+                    else:
+                        start_nav = year_df['单位净值'].iloc[0]
+                    end_nav = year_df['单位净值'].iloc[-1]
+                    year_return = (end_nav / start_nav - 1) * 100
                     annual_returns[str(year)] = round(year_return, 2)
         else:
             sharpe = max_dd = annual_return = volatility = None
             periods = {}
             annual_returns = {}
-    except:
+    except Exception:
         sharpe = max_dd = annual_return = volatility = None
         periods = {}
         annual_returns = {}
@@ -632,6 +844,317 @@ def print_fund_analysis(analysis: Dict):
     print("=" * 80)
 
 
+# 基金分类常量
+class FundType:
+    """基金类型枚举"""
+    MONEY_MARKET = "货币型"      # 股票仓位 = 0%
+    PURE_BOND = "纯债型"          # 股票仓位 < 10%
+    BOND_PLUS = "固收+"           # 股票仓位 10-30%
+    HYBRID_BOND = "偏债混合"      # 股票仓位 30-50%
+    BALANCED = "平衡型"            # 股票仓位 50-70%
+    HYBRID_STOCK = "偏股混合"     # 股票仓位 70-90%
+    STOCK = "股票型"              # 股票仓位 > 90%
+    INDEX = "指数型"               # 指数基金
+    QDII = "QDII"                # 海外基金
+    FOF = "FOF"                  # 基金中的基金
+    OTHER = "其他"
+
+
+def get_fund_real_type(fund_code: str) -> Dict:
+    """
+    获取基金的真实类型和基本信息
+    
+    Args:
+        fund_code: 基金代码
+    
+    Returns:
+        包含基金类型、名称等信息的字典
+    """
+    try:
+        # 获取基金列表信息
+        fund_list = ak.fund_open_fund_daily_em()
+        info = fund_list[fund_list['基金代码'] == fund_code]
+        
+        if len(info) == 0:
+            return {'类型': FundType.OTHER, '基金代码': fund_code}
+        
+        row = info.iloc[0]
+        
+        # 从基金简称中提取类型信息
+        fund_name = row.get('基金简称', '')
+        fund_type_str = row.get('基金类型', '')
+        
+        # 判断基金真实类型
+        fund_type = _classify_fund_type(fund_name, fund_type_str)
+        
+        return {
+            '基金代码': fund_code,
+            '基金名称': fund_name,
+            '类型': fund_type,
+            '基金类型字符串': fund_type_str
+        }
+        
+    except Exception as e:
+        return {'类型': FundType.OTHER, '基金代码': fund_code}
+
+
+def _classify_fund_type(fund_name: str, fund_type_str: str) -> str:
+    """
+    根据基金名称和类型字符串分类基金
+    
+    Args:
+        fund_name: 基金简称
+        fund_type_str: 基金类型字符串（来自API）
+    
+    Returns:
+        基金类型
+    """
+    name = fund_name.upper()
+    type_str = fund_type_str.upper() if fund_type_str else ""
+    
+    # FOF优先判断
+    if 'FOF' in name or '基金中基金' in fund_type_str:
+        return FundType.FOF
+    
+    # QDII判断
+    if 'QDII' in name or 'QDII' in type_str:
+        return FundType.QDII
+    
+    # 指数型判断
+    if '指数' in name or 'ETF' in name or 'ETF联接' in name:
+        return FundType.INDEX
+    
+    # 货币型判断
+    if '货币' in name or type_str == '货币型':
+        return FundType.MONEY_MARKET
+    
+    # 纯债型判断
+    if '纯债' in name or '短债' in name or '中短债' in name or '中低债' in name:
+        return FundType.PURE_BOND
+    
+    # 可转债判断
+    if '可转债' in name or '转债' in name:
+        return "可转债"
+    
+    # 债券型判断
+    if '债券' in name or '债基' in name:
+        if '二级债' in name or '混合债' in name:
+            return "二级债基"
+        return FundType.PURE_BOND
+    
+    # 根据基金类型字符串判断
+    if '混合' in type_str:
+        if '偏债' in type_str:
+            return FundType.HYBRID_BOND
+        elif '偏股' in type_str:
+            return FundType.HYBRID_STOCK
+        elif '平衡' in type_str:
+            return FundType.BALANCED
+        else:
+            return FundType.HYBRID_BOND  # 默认归类为偏债
+    
+    # 根据名称关键词判断（使用至少2字词组避免误匹配）
+    if any(kw in name for kw in ['稳健', '安心', '安康', '增利', '回报', '增强', '固收']):
+        return FundType.BOND_PLUS
+    
+    return FundType.OTHER
+
+
+def get_funds_by_type(fund_type: str, max_funds: int = 200, 
+                      min_stock_pct: float = None, max_stock_pct: float = None) -> List[Tuple[str, str, str]]:
+    """
+    按基金类型筛选基金
+    
+    Args:
+        fund_type: 基金类型（使用FundType常量）
+        max_funds: 最大数量
+        min_stock_pct: 最小股票仓位（可选）
+        max_stock_pct: 最大股票仓位（可选）
+    
+    Returns:
+        基金列表 [(代码, 名称, 类型), ...]
+    """
+    print(f"\n正在筛选 {fund_type} 类型基金...")
+    print("-" * 80)
+    
+    try:
+        # 获取基金排名数据
+        fund_rank = ak.fund_open_fund_rank_em()
+        print(f"✓ 获取到 {len(fund_rank)} 只开放式基金")
+        
+        # 根据类型筛选
+        if fund_type == FundType.PURE_BOND:
+            # 纯债型：排除混合、股票、指数、可转债
+            filtered = fund_rank[
+                ~fund_rank['基金简称'].str.contains('混合|股票|指数|ETF|LOF|可转债|转债', na=False, case=False) &
+                fund_rank['基金简称'].str.contains('债|债券|纯债|短债', na=False, case=False)
+            ]
+        elif fund_type == FundType.BOND_PLUS:
+            # 固收+：偏债混合、二级债基、灵活配置（排除纯债和股票型）
+            filtered = fund_rank[
+                fund_rank['基金简称'].str.contains('混合|二级债|灵活配置|固收+|稳健|增强', na=False, case=False) &
+                ~fund_rank['基金简称'].str.contains('纯债|短债|中短债|股票|指数|ETF|LOF|QDII|医药|科技|新能源|光伏|半导体|芯片', na=False, case=False)
+            ]
+        elif fund_type == FundType.HYBRID_BOND:
+            # 偏债混合
+            filtered = fund_rank[
+                fund_rank['基金简称'].str.contains('偏债|灵活配置', na=False, case=False)
+            ]
+        elif fund_type == FundType.STOCK:
+            # 股票型
+            filtered = fund_rank[
+                fund_rank['基金简称'].str.contains('股票|偏股', na=False, case=False) &
+                ~fund_rank['基金简称'].str.contains('ETF|指数|联接', na=False, case=False)
+            ]
+        elif fund_type == FundType.INDEX:
+            # 指数型
+            filtered = fund_rank[
+                fund_rank['基金简称'].str.contains('指数|ETF', na=False, case=False)
+            ]
+        else:
+            filtered = fund_rank.head(0)  # 空结果
+        
+        print(f"✓ 按类型筛选后剩余: {len(filtered)} 只")
+        
+        # 按近1年收益排序
+        filtered['近1年'] = pd.to_numeric(filtered['近1年'], errors='coerce')
+        filtered = filtered.sort_values('近1年', ascending=False)
+        
+        # 限制数量
+        selected = filtered.head(max_funds)
+        
+        result = []
+        for idx, row in selected.iterrows():
+            result.append((
+                str(row['基金代码']).zfill(6),
+                row['基金简称'],
+                fund_type
+            ))
+        
+        print(f"✓ 将分析 {len(result)} 只{fund_type}基金\n")
+        return result
+        
+    except Exception as e:
+        print(f"✗ 筛选失败: {e}")
+        return []
+
+
+def get_gushou_plus_funds(max_funds: int = 0,
+                          min_scale: float = 20.0,
+                          max_scale: float = 80.0) -> List[Tuple[str, str, str]]:
+    """
+    获取真正的固收+基金（二级债基、偏债混合、一级债基）
+
+    筛选策略（低成本指标初筛 → 全量深度分析）：
+    1. 基金类型精确匹配：债券型-混合二级 / 混合型-偏债 / 债券型-混合一级
+    2. 规模筛选：默认 20-80 亿（排除迷你基金和船大难掉头的超大基金）
+    3. 成立满 3 年：通过"近3年收益"字段是否有值来判断
+    4. 近 1 年收益合理范围 -5%~15%：排除高波动偏股产品
+    5. 按近 3 年收益排序，全量输出（max_funds=0）或取 top N 只
+
+    Args:
+        max_funds: 最大筛选数量（0=不限制，全量输出，默认0）
+        min_scale: 最小规模（亿元，默认20）
+        max_scale: 最大规模（亿元，默认80）
+
+    Returns:
+        基金列表 [(代码, 名称, 类型), ...]
+    """
+    print("\n正在从全市场基金中智能筛选固收+产品...")
+    print("-" * 100)
+
+    try:
+        # === 第一步：获取基金分类数据（精确匹配固收+类型） ===
+        name_df = ak.fund_name_em()
+        gushou_types = ['债券型-混合二级', '混合型-偏债', '债券型-混合一级']
+        type_df = name_df[name_df['基金类型'].isin(gushou_types)][['基金代码', '基金简称', '基金类型']].copy()
+        print(f"✓ 固收+类型基金（二级债基/偏债混合/一级债基）: {len(type_df)} 只")
+
+        # === 第二步：获取规模数据，筛选 min_scale ~ max_scale 亿 ===
+        import time as time_module
+        if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
+            _manager_cache['data'] = ak.fund_manager_em()
+            _manager_cache['time'] = time_module.time()
+        mgr_df = _manager_cache['data']
+
+        # 一只基金可能有多个经理，取第一条（规模是经理维度的总规模，此处用于粗筛）
+        mgr_unique = mgr_df.drop_duplicates(subset='现任基金代码', keep='first')[
+            ['现任基金代码', '现任基金资产总规模']
+        ].rename(columns={'现任基金代码': '基金代码', '现任基金资产总规模': '规模_亿'})
+
+        merged = type_df.merge(mgr_unique, on='基金代码', how='left')
+        scale_filtered = merged[
+            (merged['规模_亿'] >= min_scale) & (merged['规模_亿'] <= max_scale)
+        ].copy()
+        print(f"✓ 规模 {min_scale}-{max_scale} 亿筛选后: {len(scale_filtered)} 只")
+
+        # === 第三步：获取业绩数据，筛选成立满3年 + 收益率合理范围 ===
+        rank_df = ak.fund_open_fund_rank_em()
+        rank_df['近1年'] = pd.to_numeric(rank_df['近1年'], errors='coerce')
+        rank_df['近3年'] = pd.to_numeric(rank_df['近3年'], errors='coerce')
+        rank_cols = rank_df[['基金代码', '近1年', '近3年']].copy()
+
+        result_df = scale_filtered.merge(rank_cols, on='基金代码', how='left')
+
+        # 成立满3年（近3年数据有值）
+        result_df = result_df[result_df['近3年'].notna()].copy()
+        print(f"✓ 成立满3年筛选后: {len(result_df)} 只")
+
+        # 近1年收益合理范围
+        result_df = result_df[
+            (result_df['近1年'] >= -5) & (result_df['近1年'] <= 15)
+        ].copy()
+        print(f"✓ 近1年收益 -5%~15% 筛选后: {len(result_df)} 只")
+
+        # === 第四步：按近3年收益排序 ===
+        result_df = result_df.sort_values('近3年', ascending=False)
+        if max_funds > 0:
+            selected = result_df.head(max_funds)
+        else:
+            selected = result_df
+        print(f"✓ 按近3年收益排序，共 {len(selected)} 只将进行深度分析\n")
+
+        # 各类型分布
+        for t in gushou_types:
+            cnt = len(selected[selected['基金类型'] == t])
+            if cnt > 0:
+                print(f"  {t}: {cnt} 只")
+
+        # === 转换为输出格式 ===
+        # 基金类型映射
+        type_map = {
+            '债券型-混合二级': '二级债基',
+            '混合型-偏债': '偏债混合',
+            '债券型-混合一级': '一级债基',
+        }
+
+        result = []
+        for _, row in selected.iterrows():
+            code = str(row['基金代码']).zfill(6)
+            name = row['基金简称']
+            ftype = type_map.get(row['基金类型'], '固收+')
+            result.append((code, name, ftype))
+
+        return result
+
+    except Exception as e:
+        print(f"✗ 获取基金列表失败: {e}")
+        print("将使用备选固收+基金池...")
+        # 备选固收+基金池（经典的固收+产品）
+        return [
+            ('002015', '南方荣光A', '偏债混合'),
+            ('004010', '华泰柏瑞鼎利混合A', '偏债混合'),
+            ('001822', '华泰柏瑞惠利混合A', '偏债混合'),
+            ('001316', '安信稳健增值混合A', '偏债混合'),
+            ('000047', '华夏鼎泓债券A', '二级债基'),
+            ('003859', '招商招旭纯债A', '纯债'),
+            ('000171', '易方达裕丰回报债券', '二级债基'),
+            ('002351', '易方达裕祥回报债券', '二级债基'),
+            ('000385', '景顺长城景颐双利债券A', '二级债基'),
+            ('270002', '广发稳健增长混合A', '偏债混合'),
+        ]
+
+
 def get_all_gushou_funds(max_funds: int = 200) -> List[Tuple[str, str, str]]:
     """
     从所有基金中智能筛选优质基金
@@ -676,12 +1199,10 @@ def get_all_gushou_funds(max_funds: int = 200) -> List[Tuple[str, str, str]]:
         print(f"✓ 排除股票型/行业主题型后剩余: {len(filtered)} 只")
         
         # 第二步：筛选稳健型基金特征
-        include_keywords = ['债', '债券', '稳健', '增利', '鼎', '丰', '裕', '兴', 
-                           '益', '瑞', '祥', '安', '合', '享', '顺', '优', '增强', 
-                           '回报', '精选', '添', '稳', '利', '盈', '富', '悦', '泰',
-                           '恒', '盛', '荣', '华', '嘉', '悦', '怡', '和', '康',
-                           '宁', '静', '怡', '乐', '悦', '欣', '嘉', '祥', '福',
-                           '双债', '强债', '信用债', '可转债', '纯债']
+        include_keywords = ['债券', '债基', '稳健', '增利', '鼎利', '丰利', '裕丰',
+                           '添利', '回报', '精选', '增强', '双债', '强债', '信用债',
+                           '可转债', '纯债', '短债', '安心', '安康', '恒利', '盛利',
+                           '混合', '偏债', '灵活配置', '固收']
         
         # 包含稳健型基金特征的基金
         gushou_funds = filtered[
@@ -739,6 +1260,439 @@ def get_all_gushou_funds(max_funds: int = 200) -> List[Tuple[str, str, str]]:
         ]
 
 
+def get_stock_funds(max_funds: int = 100) -> List[Tuple[str, str, str]]:
+    """
+    获取股票类基金（包括股票型、偏股混合型、指数基金等）
+    
+    筛选逻辑：
+    1. 从所有开放式基金中筛选
+    2. 优先选择股票型、偏股混合型、指数基金
+    3. 排除明显债券型、货币型产品
+    4. 按近1年收益率排序，优先分析表现好的
+    
+    Args:
+        max_funds: 最大筛选数量（默认100）
+    
+    Returns:
+        基金列表 [(代码, 名称, 类型), ...]
+    """
+    print("\n正在从全市场基金中智能筛选股票类产品...")
+    print("-" * 100)
+    
+    try:
+        # 获取所有开放式基金排名
+        fund_rank = ak.fund_open_fund_rank_em()
+        total = len(fund_rank)
+        print(f"✓ 获取到 {total} 只开放式基金")
+        
+        # 股票型基金关键词
+        stock_keywords = [
+            '股票', '偏股', '成长', '价值', '精选', '优势', '领先', '新锐',
+            '蓝筹', '红利', '量化', '指数', 'ETF', '沪深300', '中证500',
+            '创业板', '科创板', '新能源', '科技', '医药', '消费', '白酒',
+            '半导体', '芯片', '军工', '光伏', '制造', '创新', '新兴'
+        ]
+        
+        # 排除债券型关键词
+        exclude_keywords = [
+            '债', '债券', '纯债', '短债', '中短债', '可转债', '货币', '理财',
+            '稳健', '保守', '保本', '安', '稳', '盈', '丰', '鼎', '裕'
+        ]
+        
+        # 第一步：筛选包含股票型特征的基金
+        stock_funds = fund_rank[
+            fund_rank['基金简称'].str.contains('|'.join(stock_keywords), na=False, case=False)
+        ].copy()
+        
+        print(f"✓ 筛选出股票型特征基金: {len(stock_funds)} 只")
+        
+        # 第二步：排除债券型特征基金
+        stock_funds = stock_funds[
+            ~stock_funds['基金简称'].str.contains('|'.join(exclude_keywords), na=False, case=False)
+        ].copy()
+        
+        print(f"✓ 排除债券型后剩余: {len(stock_funds)} 只")
+        
+        # 第三步：通过收益率筛选（股票型基金收益通常较高）
+        stock_funds['近1年'] = pd.to_numeric(stock_funds['近1年'], errors='coerce')
+        
+        # 股票型基金特征：近1年收益通常在 -20% 到 100% 之间
+        stock_funds = stock_funds[
+            (stock_funds['近1年'] >= -20) & 
+            (stock_funds['近1年'] <= 100)
+        ].sort_values('近1年', ascending=False)
+        
+        print(f"✓ 收益率筛选后剩余: {len(stock_funds)} 只")
+        
+        # 限制数量
+        selected = stock_funds.head(max_funds)
+        print(f"✓ 将分析前 {len(selected)} 只股票类基金\n")
+        
+        # 转换为需要的格式
+        result = []
+        for idx, row in selected.iterrows():
+            name = row['基金简称']
+            # 判断基金类型
+            if '指数' in name or 'ETF' in name:
+                ftype = '指数型'
+            elif '股票' in name:
+                ftype = '股票型'
+            elif '混合' in name:
+                ftype = '混合型-偏股'
+            else:
+                ftype = '股票型'
+            
+            result.append((str(row['基金代码']).zfill(6), name, ftype))
+        
+        return result
+        
+    except Exception as e:
+        print(f"✗ 获取基金列表失败: {e}")
+        print("将使用备选股票基金池...")
+        # 备选股票基金池
+        return [
+            ('110022', '易方达消费行业股票', '股票型'),
+            ('161725', '招商中证白酒指数A', '指数型'),
+            ('005911', '广发双擎升级混合A', '混合型-偏股'),
+            ('002190', '农银新能源主题A', '混合型-偏股'),
+            ('004997', '广发高端制造股票A', '股票型'),
+        ]
+
+
+def filter_quality_stock_funds(df: pd.DataFrame,
+                                min_calmar: float = 1.2,
+                                min_info_ratio: float = 0.5,
+                                max_drawdown_limit: float = -30,
+                                min_annual_return: float = 0.10) -> pd.DataFrame:
+    """
+    使用专业标准筛选优质股票型基金
+
+    筛选标准（基于Alpha策略）：
+    1. 卡玛比率 > 1.2：收益回撤比优秀
+    2. 信息比率 > 0.5：有稳定超额收益能力
+    3. 最大回撤 < 30%：风险控制良好
+    4. 年化收益 > 10%：进攻能力充足
+    
+    Args:
+        df: 分析结果 DataFrame
+        min_calmar: 最小卡玛比率
+        min_info_ratio: 最小信息比率
+        max_drawdown_limit: 最大回撤限制
+        min_annual_return: 最小年化收益率
+    
+    Returns:
+        筛选后的 DataFrame
+    """
+    # 计算卡玛比率（如果还没有）
+    if '卡玛比率' not in df.columns:
+        df['卡玛比率'] = df.apply(
+            lambda row: calculate_calmar_ratio(
+                row['年化收益率(%)'] / 100 if pd.notna(row['年化收益率(%)']) else 0,
+                row['最大回撤(%)'] / 100 if pd.notna(row['最大回撤(%)']) else -0.5
+            ), axis=1
+        )
+    
+    # 专业筛选条件
+    quality_funds = df[
+        (df['卡玛比率'] >= min_calmar) & 
+        (df['最大回撤(%)'] >= max_drawdown_limit) &
+        (df['年化收益率(%)'] >= min_annual_return * 100)
+    ].copy()
+    
+    # 按卡玛比率排序
+    quality_funds = quality_funds.sort_values('卡玛比率', ascending=False)
+    
+    return quality_funds
+
+
+def filter_quality_gushou_plus_funds(df: pd.DataFrame,
+                                      min_sharpe: float = 0.8,
+                                      min_sortino: float = 1.2,
+                                      max_drawdown_limit: float = -5.0,
+                                      min_annual_return: float = 3.5) -> pd.DataFrame:
+    """
+    筛选优质固收+基金
+
+    固收+基金筛选标准：
+    1. 夏普比率 > 0.8：风险收益性价比良好
+    2. 索提诺比率 > 1.2：下行风险控制优秀
+    3. 最大回撤 < 5%：底线防守（固收+的防守底色）
+    4. 年化收益 > 3.5%：超越纯债收益（体现"+"的价值）
+
+    为什么用索提诺替代/补充夏普：
+    - 夏普惩罚所有波动（包括上涨），对固收+不公平
+    - 索提诺只惩罚下行波动，更符合固收+投资者偏好
+    - 优秀固收+的索提诺通常显著高于夏普
+
+    Args:
+        df: 分析结果 DataFrame
+        min_sharpe: 最小夏普比率（默认0.8）
+        min_sortino: 最小索提诺比率（默认1.2）
+        max_drawdown_limit: 最大回撤限制（默认-5%）
+        min_annual_return: 最小年化收益率（默认3.5%）
+    
+    Returns:
+        筛选后的 DataFrame
+    """
+    # 确保有必要列
+    required_cols = ['夏普比率', '最大回撤(%)', '年化收益率(%)']
+    for col in required_cols:
+        if col not in df.columns:
+            print(f"警告: 缺少列 {col}")
+            return pd.DataFrame()
+    
+    # 铁三角筛选条件
+    quality_funds = df[
+        (df['夏普比率'] >= min_sharpe) & 
+        (df['最大回撤(%)'] >= max_drawdown_limit) &
+        (df['年化收益率(%)'] >= min_annual_return)
+    ].copy()
+    
+    # 如果有索提诺比率，加入筛选
+    if '索提诺比率' in df.columns:
+        quality_funds = quality_funds[quality_funds['索提诺比率'] >= min_sortino]
+        # 按索提诺比率排序（优先）
+        quality_funds = quality_funds.sort_values(['索提诺比率', '夏普比率'], ascending=[False, False])
+    else:
+        # 按夏普比率排序
+        quality_funds = quality_funds.sort_values('夏普比率', ascending=False)
+    
+    return quality_funds
+
+
+def analyze_gushou_plus_funds_advanced(fund_list: List[Tuple[str, str, str]],
+                                        min_sharpe: float = 0.8,
+                                        min_sortino: float = 1.2,
+                                        max_drawdown: float = -5.0,
+                                        min_return: float = 3.5,
+                                        delay: float = 0.3) -> pd.DataFrame:
+    """
+    使用"铁三角"标准批量分析固收+基金
+
+    核心指标：
+    - 夏普比率 (Sharpe Ratio) >= 0.8
+    - 索提诺比率 (Sortino Ratio) >= 1.2
+    - 最大回撤 < 5%
+    - 年化收益 > 3.5%
+
+    固收+基金特征：
+    - 股票仓位通常在10%-20%
+    - 债券仓位提供安全垫
+    - 通过股票/可转债/打新增厚收益
+    - 追求"稳中求进"
+
+    Args:
+        fund_list: 基金列表，格式 [(代码, 名称, 类型), ...]
+        min_sharpe: 最小夏普比率
+        min_sortino: 最小索提诺比率
+        max_drawdown: 最大回撤限制（负数）
+        min_return: 最小年化收益率
+        delay: 请求间隔（秒）
+
+    Returns:
+        分析结果 DataFrame
+    """
+    print(f"\n开始专业分析 {len(fund_list)} 只固收+基金...")
+    print("=" * 100)
+    print("【固收+铁三角筛选标准】")
+    print(f"  • 夏普比率 >= {min_sharpe}（风险收益性价比）")
+    print(f"  • 索提诺比率 >= {min_sortino}（下行风险控制）")
+    print(f"  • 最大回撤 >= {max_drawdown}%（底线防守）")
+    print(f"  • 年化收益 >= {min_return}%（超越纯债）")
+    print("=" * 100)
+    print()
+    
+    results = []
+    for idx, (code, name, ftype) in enumerate(fund_list, 1):
+        print(f"[{idx:3d}/{len(fund_list)}] {code} {name[:30]}", end=" ")
+
+        try:
+            # 获取基金历史数据
+            df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+
+            if df is None or len(df) < 750:
+                print("✗ 数据不足")
+                continue
+
+            df['净值日期'] = pd.to_datetime(df['净值日期'])
+            df = df.sort_values('净值日期')
+            df['日收益率'] = df['单位净值'].pct_change()
+
+            # 使用近3年窗口计算核心指标
+            window_df = df.tail(METRICS_WINDOW_DAYS)
+            returns = window_df['日收益率'].dropna()
+
+            # 计算铁三角指标
+            sharpe = calculate_sharpe_ratio(returns)
+            sortino = calculate_sortino_ratio(returns)
+            max_dd = calculate_max_drawdown(window_df['单位净值'])
+            annual_return = calculate_annualized_return(window_df['单位净值'])
+            volatility = returns.std() * np.sqrt(252)
+
+            # 按日期计算阶段收益
+            return_1y = _calc_period_return(df, 1)
+            return_2y = _calc_period_return(df, 2)
+
+            # 获取基金规模和资产配置
+            scale_info = get_fund_scale(code)
+            asset_info = get_fund_asset_allocation(code)
+
+            metrics = {
+                '基金代码': code,
+                '基金名称': name,
+                '类型': ftype,
+                '夏普比率': round(sharpe, 2) if not np.isnan(sharpe) else None,
+                '索提诺比率': round(sortino, 2) if not np.isnan(sortino) else None,
+                '最大回撤(%)': round(max_dd * 100, 2) if not np.isnan(max_dd) else None,
+                '年化收益率(%)': round(annual_return * 100, 2) if not np.isnan(annual_return) else None,
+                '年化波动率(%)': round(volatility * 100, 2) if not np.isnan(volatility) else None,
+                '近1年收益(%)': round(return_1y, 2) if return_1y is not None else None,
+                '近2年年化(%)': round(return_2y, 2) if return_2y is not None else None,
+                '数据天数': len(df),
+                **scale_info,
+                **asset_info
+            }
+            
+            results.append(metrics)
+            
+            # 显示关键指标
+            sharpe_str = f"{sharpe:.2f}" if not np.isnan(sharpe) else "N/A"
+            sortino_str = f"{sortino:.2f}" if not np.isnan(sortino) else "N/A"
+            dd_str = f"{max_dd*100:.1f}" if not np.isnan(max_dd) else "N/A"
+            ret_str = f"{annual_return*100:.1f}" if not np.isnan(annual_return) else "N/A"
+            print(f"✓ 夏普:{sharpe_str} 索提诺:{sortino_str} 回撤:{dd_str}% 收益:{ret_str}%")
+            
+        except Exception as e:
+            print(f"✗ 错误: {str(e)[:30]}")
+        
+        time.sleep(delay)
+    
+    if not results:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(results)
+    
+    # 按索提诺比率排序（固收+更看重下行风险）
+    if '索提诺比率' in df.columns:
+        df = df.sort_values('索提诺比率', ascending=False)
+    elif '夏普比率' in df.columns:
+        df = df.sort_values('夏普比率', ascending=False)
+    
+    return df
+
+
+def analyze_stock_funds_advanced(fund_list: List[Tuple[str, str, str]], 
+                                  min_calmar: float = 1.2,
+                                  max_drawdown: float = -30,
+                                  min_return: float = 0.15,
+                                  delay: float = 0.3) -> pd.DataFrame:
+    """
+    使用专业标准批量分析股票型基金
+    
+    增加指标：
+    - 卡玛比率 (Calmar Ratio)
+    - 信息比率 (Information Ratio) - 需要基准数据
+    - 风格一致性评分
+    
+    Args:
+        fund_list: 基金列表，格式 [(代码, 名称, 类型), ...]
+        min_calmar: 最小卡玛比率
+        max_drawdown: 最大回撤限制
+        min_return: 最小年化收益率
+        delay: 请求间隔（秒）
+    
+    Returns:
+        分析结果 DataFrame
+    """
+    print(f"开始专业分析 {len(fund_list)} 只股票型基金...")
+    print("=" * 100)
+    print("筛选标准：")
+    print(f"  • 卡玛比率 >= {min_calmar}")
+    print(f"  • 最大回撤 >= {max_drawdown}%")
+    print(f"  • 年化收益 >= {min_return*100}%")
+    print("=" * 100)
+    print()
+    
+    results = []
+    for idx, (code, name, ftype) in enumerate(fund_list, 1):
+        print(f"[{idx:3d}/{len(fund_list)}] {code} {name[:30]}", end=" ")
+
+        try:
+            # 获取基金历史数据
+            df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+
+            if df is None or len(df) < 750:
+                print("✗ 数据不足")
+                continue
+
+            df['净值日期'] = pd.to_datetime(df['净值日期'])
+            df = df.sort_values('净值日期')
+            df['日收益率'] = df['单位净值'].pct_change()
+
+            # 使用近3年窗口计算核心指标
+            window_df = df.tail(METRICS_WINDOW_DAYS)
+            returns = window_df['日收益率'].dropna()
+
+            # 计算基础指标
+            sharpe = calculate_sharpe_ratio(returns)
+            max_dd = calculate_max_drawdown(window_df['单位净值'])
+            annual_return = calculate_annualized_return(window_df['单位净值'])
+            volatility = returns.std() * np.sqrt(252)
+
+            # 计算卡玛比率（基于近3年窗口）
+            calmar = calculate_calmar_ratio(annual_return, max_dd)
+
+            # 按日期计算阶段收益
+            return_1y = _calc_period_return(df, 1)
+            return_2y = _calc_period_return(df, 2)
+
+            # 获取基金规模
+            scale_info = get_fund_scale(code)
+
+            # 获取资产配置
+            asset_info = get_fund_asset_allocation(code)
+
+            metrics = {
+                '基金代码': code,
+                '基金名称': name,
+                '类型': ftype,
+                '夏普比率': round(sharpe, 2) if not np.isnan(sharpe) else None,
+                '卡玛比率': round(calmar, 2) if not np.isnan(calmar) else None,
+                '最大回撤(%)': round(max_dd * 100, 2) if not np.isnan(max_dd) else None,
+                '年化收益率(%)': round(annual_return * 100, 2) if not np.isnan(annual_return) else None,
+                '年化波动率(%)': round(volatility * 100, 2) if not np.isnan(volatility) else None,
+                '近1年收益(%)': round(return_1y, 2) if return_1y is not None else None,
+                '近2年年化(%)': round(return_2y, 2) if return_2y is not None else None,
+                '数据天数': len(df),
+                **scale_info,
+                **asset_info
+            }
+            
+            results.append(metrics)
+            
+            # 显示关键指标
+            calmar_str = f"{calmar:.2f}" if not np.isnan(calmar) else "N/A"
+            dd_str = f"{max_dd*100:.1f}" if not np.isnan(max_dd) else "N/A"
+            ret_str = f"{annual_return*100:.1f}" if not np.isnan(annual_return) else "N/A"
+            print(f"✓ 卡玛:{calmar_str} 回撤:{dd_str}% 收益:{ret_str}%")
+            
+        except Exception as e:
+            print(f"✗ 错误: {str(e)[:30]}")
+        
+        time.sleep(delay)
+    
+    if not results:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(results)
+    
+    # 按卡玛比率排序
+    if '卡玛比率' in df.columns:
+        df = df.sort_values('卡玛比率', ascending=False)
+    
+    return df
+
+
 def main():
     """主函数 - 默认从全基金池筛选"""
     import sys
@@ -747,6 +1701,43 @@ def main():
     print(" " * 40 + "基金分析技能")
     print(" " * 35 + "全市场智能筛选 + 深度分析")
     print("=" * 120)
+    
+    # ===================== 自定义参数解析 =====================
+    custom_params = {
+        'min_sharpe': None,      # 最小夏普比率
+        'max_drawdown': None,    # 最大回撤（负数）
+        'min_return': None,      # 最小年化收益
+        'min_calmar': None,      # 最小卡玛比率
+        'min_sortino': None,     # 最小索提诺比率
+    }
+    
+    # 解析自定义参数
+    for i, arg in enumerate(sys.argv):
+        if arg == '--min-sharpe' and i + 1 < len(sys.argv):
+            try:
+                custom_params['min_sharpe'] = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+        elif arg == '--max-dd' and i + 1 < len(sys.argv):
+            try:
+                custom_params['max_drawdown'] = -abs(float(sys.argv[i + 1]))
+            except ValueError:
+                pass
+        elif arg == '--min-return' and i + 1 < len(sys.argv):
+            try:
+                custom_params['min_return'] = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+        elif arg == '--min-calmar' and i + 1 < len(sys.argv):
+            try:
+                custom_params['min_calmar'] = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+        elif arg == '--min-sortino' and i + 1 < len(sys.argv):
+            try:
+                custom_params['min_sortino'] = float(sys.argv[i + 1])
+            except ValueError:
+                pass
     
     # 检查是否有命令行参数（单个基金分析模式）
     if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
@@ -766,21 +1757,365 @@ def main():
     
     # 解析参数
     max_funds = 200  # 默认200只
+    fund_type = 'gushou'  # 默认为固收型
+    
     if '--max' in sys.argv:
         idx = sys.argv.index('--max')
         if idx + 1 < len(sys.argv):
             try:
                 max_funds = int(sys.argv[idx + 1])
                 max_funds = max(50, min(max_funds, 500))  # 限制50-500
-            except:
+            except ValueError:
                 pass
     
-    print(f"📊 分析数量: {max_funds} 只基金")
-    print(f"⏱️  预计耗时: {max_funds * 6 // 60} 分钟左右")
-    print()
+    # 检查是否使用专业股票型基金筛选
+    if '--stock-alpha' in sys.argv:
+        fund_type = 'stock_alpha'
+
+        # 应用自定义参数，否则使用默认值
+        min_calmar_val = custom_params['min_calmar'] if custom_params['min_calmar'] else 1.2
+        max_dd_val = custom_params['max_drawdown'] if custom_params['max_drawdown'] else -30.0
+        min_ret_val = custom_params['min_return'] if custom_params['min_return'] else 10.0
+
+        print("\n🚀 专业股票型基金筛选（Alpha策略）")
+        print("=" * 120)
+        print("筛选标准：")
+        print(f"  • 卡玛比率 >= {min_calmar_val}（收益回撤比优秀）")
+        print(f"  • 最大回撤 <= {-max_dd_val}%（风险控制良好）")
+        print(f"  • 年化收益 >= {min_ret_val}%（进攻能力充足）")
+        print("=" * 120)
+        print()
+
+        print(f"📊 分析数量: {max_funds} 只股票类基金")
+        print()
+        
+        # 从全市场获取股票型基金池
+        fund_pool = get_stock_funds(max_funds=max_funds)
+        
+        if len(fund_pool) == 0:
+            print("\n❌ 未获取到基金数据")
+            return
+        
+        # 去重
+        seen = set()
+        unique_funds = []
+        for fund in fund_pool:
+            if fund[0] not in seen:
+                seen.add(fund[0])
+                unique_funds.append(fund)
+        
+        print(f"🎯 实际分析 {len(unique_funds)} 只基金\n")
+        
+        # 使用专业标准分析股票型基金
+        df = analyze_stock_funds_advanced(unique_funds)
+        
+        if len(df) == 0:
+            print("\n❌ 未获取到有效数据")
+            return
+        
+        # 使用专业标准筛选
+        high_quality = filter_quality_stock_funds(df, min_calmar=min_calmar_val, max_drawdown_limit=max_dd_val, min_annual_return=min_ret_val / 100)
+        
+        # 保存结果
+        output_file = "股票型基金筛选结果.csv"
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        
+        # 显示结果
+        print("\n" + "=" * 120)
+        print(" " * 45 + "🎉 专业股票型基金筛选结果")
+        print("=" * 120)
+        print(f"\n【分析 {len(df)} 只基金，{len(high_quality)} 只符合Alpha标准（卡玛>={min_calmar_val} & 回撤<{-max_dd_val}% & 收益>{min_ret_val}%）】\n")
+        
+        if len(high_quality) > 0:
+            display_cols = ['基金代码', '基金名称', '类型', '卡玛比率', '夏普比率', '最大回撤(%)', 
+                           '年化收益率(%)', '近1年收益(%)', '基金规模(亿元)']
+            print("🏆 Alpha优质基金 TOP 20（推荐关注）：")
+            print("-" * 120)
+            print(high_quality[display_cols].head(20).to_string(index=False))
+        else:
+            print(f"⚠️  未找到符合Alpha标准（卡玛>={min_calmar_val} & 回撤<{-max_dd_val}% & 收益>{min_ret_val}%）的基金")
+            print("   建议放宽条件查看全部结果\n")
+        
+        print("\n\n📊 全部基金按卡玛比率排序（TOP 30）：")
+        print("-" * 120)
+        display_cols2 = ['基金代码', '基金名称', '类型', '卡玛比率', '夏普比率', '最大回撤(%)', 
+                        '年化收益率(%)', '股票仓位(%)', '基金规模(亿元)']
+        print(df[display_cols2].head(30).to_string(index=False))
+        
+        # 统计
+        print("\n\n" + "=" * 120)
+        print(" " * 50 + "📈 统计摘要")
+        print("=" * 120)
+        print(f"分析基金总数: {len(df)}")
+        print(f"卡玛比率>=2.0: {len(df[df['卡玛比率'] >= 2.0])} 只 (卓越)")
+        print(f"卡玛比率>=1.5: {len(df[df['卡玛比率'] >= 1.5])} 只 (优秀)")
+        print(f"卡玛比率>=1.2: {len(df[df['卡玛比率'] >= 1.2])} 只 (良好)")
+        print(f"平均卡玛比率: {df['卡玛比率'].mean():.2f}")
+        print(f"平均夏普比率: {df['夏普比率'].mean():.2f}")
+        print(f"平均最大回撤: {df['最大回撤(%)'].mean():.2f}%")
+        print(f"平均年化收益: {df['年化收益率(%)'].mean():.2f}%")
+        
+        # 按类型统计
+        print("\n按类型统计：")
+        type_stats = df.groupby('类型').agg({
+            '卡玛比率': 'mean',
+            '夏普比率': 'mean',
+            '最大回撤(%)': 'mean',
+            '年化收益率(%)': 'mean',
+            '基金代码': 'count'
+        }).round(2)
+        type_stats.columns = ['平均卡玛', '平均夏普', '平均回撤', '平均收益', '数量']
+        print(type_stats.to_string())
+        
+        print(f"\n✅ 详细结果已保存到: {output_file}")
+        print("\n💡 使用建议:")
+        print("   • 优先关注卡玛比率>1.2且回撤<30%的基金")
+        print("   • 卡玛比率 = 年化收益 / |最大回撤|，衡量收益风险比")
+        print("   • 可通过 'npx mutual-fund-skills <基金代码>' 进行单基金深度分析")
+        print("=" * 120)
+        return
+
+    # ===================== 纯债基金筛选模式 =====================
+    if '--bond' in sys.argv or '--pure-bond' in sys.argv:
+        print("\n🚀 纯债基金筛选（低风险）")
+        print("=" * 120)
+        
+        # 筛选标准（纯债要求更低回撤、更稳收益）
+        min_sharpe_val = custom_params['min_sharpe'] if custom_params['min_sharpe'] else 1.0
+        max_dd_val = custom_params['max_drawdown'] if custom_params['max_drawdown'] else -2.0
+        min_ret_val = custom_params['min_return'] if custom_params['min_return'] else 2.5
+        
+        print("【筛选标准】")
+        print(f"  • 夏普比率 >= {min_sharpe_val}（风险收益性价比）")
+        print(f"  • 最大回撤 <= {-max_dd_val}%（底线防守）")
+        print(f"  • 年化收益 >= {min_ret_val}%（稳定收益）")
+        print("=" * 120)
+        print()
+        
+        print(f"📊 分析数量: {max_funds} 只纯债基金")
+        print()
+        
+        # 使用新的按类型筛选函数
+        fund_pool = get_funds_by_type(FundType.PURE_BOND, max_funds=max_funds)
+        
+        if len(fund_pool) == 0:
+            print("\n❌ 未获取到基金数据")
+            return
+        
+        # 去重
+        seen = set()
+        unique_funds = []
+        for fund in fund_pool:
+            if fund[0] not in seen:
+                seen.add(fund[0])
+                unique_funds.append(fund)
+        
+        print(f"🎯 实际分析 {len(unique_funds)} 只纯债基金\n")
+        
+        # 使用固收+分析函数（但标准不同）
+        df = analyze_gushou_plus_funds_advanced(
+            unique_funds,
+            min_sharpe=min_sharpe_val,
+            max_drawdown=max_dd_val,
+            min_return=min_ret_val
+        )
+        
+        if len(df) == 0:
+            print("\n❌ 未获取到有效数据")
+            return
+        
+        # 筛选符合条件的基金
+        quality_funds = df[
+            (df['夏普比率'] >= min_sharpe_val) & 
+            (df['最大回撤(%)'] >= max_dd_val) &
+            (df['年化收益率(%)'] >= min_ret_val)
+        ].copy()
+        
+        # 保存结果
+        output_file = "纯债基金筛选结果.csv"
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        
+        # 显示结果
+        print("\n" + "=" * 120)
+        print(" " * 50 + "🎉 纯债基金筛选结果")
+        print("=" * 120)
+        print(f"\n【分析 {len(df)} 只纯债基金，{len(quality_funds)} 只符合标准】\n")
+        
+        if len(quality_funds) > 0:
+            display_cols = ['基金代码', '基金名称', '类型', '夏普比率', '最大回撤(%)', 
+                           '年化收益率(%)', '近1年收益(%)', '基金规模(亿元)']
+            print("🏆 优质纯债基金 TOP 20：")
+            print("-" * 120)
+            print(quality_funds[display_cols].head(20).to_string(index=False))
+        
+        print("\n\n📊 全部纯债基金按夏普比率排序（TOP 30）：")
+        print("-" * 120)
+        display_cols2 = ['基金代码', '基金名称', '类型', '夏普比率', '最大回撤(%)', 
+                        '年化收益率(%)', '基金规模(亿元)']
+        print(df[display_cols2].head(30).to_string(index=False))
+        
+        # 统计
+        print("\n\n" + "=" * 120)
+        print(" " * 50 + "📈 统计摘要")
+        print("=" * 120)
+        print(f"分析基金总数: {len(df)}")
+        print(f"夏普比率>=1.0: {len(df[df['夏普比率'] >= 1.0])} 只 (优秀)")
+        print(f"夏普比率>=0.8: {len(df[df['夏普比率'] >= 0.8])} 只 (良好)")
+        print(f"平均夏普比率: {df['夏普比率'].mean():.2f}")
+        print(f"平均最大回撤: {df['最大回撤(%)'].mean():.2f}%")
+        print(f"平均年化收益: {df['年化收益率(%)'].mean():.2f}%")
+        
+        print(f"\n✅ 详细结果已保存到: {output_file}")
+        print("\n💡 使用建议:")
+        print("   • 纯债基金适合保守型投资者")
+        print("   • 优先关注回撤<2%、夏普>1.0的产品")
+        print("=" * 120)
+        return
     
-    # 从全市场获取基金池
-    fund_pool = get_all_gushou_funds(max_funds=max_funds)
+    # 检查是否使用固收+专业筛选模式
+    if '--gushou-plus' in sys.argv:
+        fund_type = 'gushou_plus'
+
+        # 应用自定义参数，否则使用默认值
+        min_sharpe_val = custom_params['min_sharpe'] if custom_params['min_sharpe'] else 0.8
+        max_dd_val = custom_params['max_drawdown'] if custom_params['max_drawdown'] else -5.0
+        min_ret_val = custom_params['min_return'] if custom_params['min_return'] else 3.5
+        min_sortino_val = custom_params['min_sortino'] if custom_params['min_sortino'] else 1.2
+
+        print("\n🚀 固收+基金专业筛选")
+        print("=" * 120)
+        print("【筛选标准】")
+        print(f"  • 夏普比率 >= {min_sharpe_val}（风险收益性价比）")
+        print(f"  • 索提诺比率 >= {min_sortino_val}（下行风险控制）")
+        print(f"  • 最大回撤 <= {-max_dd_val}%（底线防守）")
+        print(f"  • 年化收益 >= {min_ret_val}%（超越纯债）")
+        print("=" * 120)
+        print()
+
+        print(f"📊 固收+基金全量筛选（规模20-80亿，成立满3年）")
+        print()
+
+        # 从全市场获取固收+基金池（全量初筛，不截断）
+        fund_pool = get_gushou_plus_funds()
+
+        if len(fund_pool) == 0:
+            print("\n❌ 未获取到基金数据")
+            return
+
+        # 去重
+        seen = set()
+        unique_funds = []
+        for fund in fund_pool:
+            if fund[0] not in seen:
+                seen.add(fund[0])
+                unique_funds.append(fund)
+
+        print(f"🎯 实际分析 {len(unique_funds)} 只基金\n")
+
+        # 使用铁三角标准分析固收+基金
+        df = analyze_gushou_plus_funds_advanced(unique_funds)
+
+        if len(df) == 0:
+            print("\n❌ 未获取到有效数据")
+            return
+
+        # 筛选 - 优先看回撤
+        high_quality = df[
+            (df['最大回撤(%)'] >= max_dd_val) &
+            (df['年化收益率(%)'] >= min_ret_val) &
+            (df['夏普比率'] >= min_sharpe_val)
+        ].copy()
+
+        # 如果有索提诺比率，加入筛选
+        if '索提诺比率' in high_quality.columns:
+            high_quality = high_quality[high_quality['索提诺比率'] >= min_sortino_val]
+
+        # 按回撤排序（从小到大）
+        high_quality = high_quality.sort_values('最大回撤(%)', ascending=False)
+
+        # 保存结果
+        output_file = "固收+基金筛选结果.csv"
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+        # 显示结果 - 按回撤排序
+        print("\n" + "=" * 120)
+        print(" " * 45 + "🎉 固收+基金筛选结果")
+        print("=" * 120)
+        print(f"\n【分析 {len(df)} 只基金，{len(high_quality)} 只符合标准】\n")
+        print(f"筛选标准：夏普>={min_sharpe_val} & 索提诺>={min_sortino_val} & 回撤<{-max_dd_val}% & 收益>{min_ret_val}%")
+        print()
+        
+        if len(high_quality) > 0:
+            display_cols = ['基金代码', '基金名称', '类型', '索提诺比率', '夏普比率', '最大回撤(%)', 
+                           '年化收益率(%)', '近1年收益(%)', '基金规模(亿元)', '股票仓位(%)']
+            print("🏆 铁三角优质基金 TOP 20（推荐关注）：")
+            print("-" * 120)
+            print(high_quality[display_cols].head(20).to_string(index=False))
+        else:
+            print("⚠️  未找到符合铁三角标准的基金")
+            print("   建议放宽条件查看全部结果\n")
+        
+        print("\n\n📊 全部基金按索提诺比率排序（TOP 30）：")
+        print("-" * 120)
+        display_cols2 = ['基金代码', '基金名称', '类型', '索提诺比率', '夏普比率', '最大回撤(%)', 
+                        '年化收益率(%)', '股票仓位(%)', '基金规模(亿元)']
+        print(df[display_cols2].head(30).to_string(index=False))
+        
+        # 统计
+        print("\n\n" + "=" * 120)
+        print(" " * 50 + "📈 统计摘要")
+        print("=" * 120)
+        print(f"分析基金总数: {len(df)}")
+        if '索提诺比率' in df.columns:
+            print(f"索提诺比率>=2.0: {len(df[df['索提诺比率'] >= 2.0])} 只 (卓越)")
+            print(f"索提诺比率>=1.5: {len(df[df['索提诺比率'] >= 1.5])} 只 (优秀)")
+            print(f"平均索提诺比率: {df['索提诺比率'].mean():.2f}")
+        print(f"夏普比率>=1.5: {len(df[df['夏普比率'] >= 1.5])} 只 (优秀)")
+        print(f"夏普比率>=1.0: {len(df[df['夏普比率'] >= 1.0])} 只 (良好)")
+        print(f"平均夏普比率: {df['夏普比率'].mean():.2f}")
+        print(f"平均最大回撤: {df['最大回撤(%)'].mean():.2f}%")
+        print(f"平均年化收益: {df['年化收益率(%)'].mean():.2f}%")
+        
+        # 按类型统计
+        print("\n按类型统计：")
+        type_stats = df.groupby('类型').agg({
+            '索提诺比率': 'mean',
+            '夏普比率': 'mean',
+            '最大回撤(%)': 'mean',
+            '年化收益率(%)': 'mean',
+            '基金代码': 'count'
+        }).round(2)
+        type_stats.columns = ['平均索提诺', '平均夏普', '平均回撤', '平均收益', '数量']
+        print(type_stats.to_string())
+        
+        print(f"\n✅ 详细结果已保存到: {output_file}")
+        print("\n💡 使用建议:")
+        print("   • 优先关注索提诺比率>1.2且回撤<5%的基金")
+        print("   • 索提诺比率 = (年化收益-无风险利率) / 下行标准差")
+        print("   • 固收+核心：夏普>0.8 + 索提诺>1.2 + 回撤<5%")
+        print("   • 可通过 'npx mutual-fund-skills <基金代码>' 进行单基金深度分析")
+        print("=" * 120)
+        return
+    
+    # 检查是否筛选股票型基金（普通模式）
+    # 应用自定义参数，否则使用默认值
+    min_sharpe_val = custom_params['min_sharpe'] if custom_params['min_sharpe'] else 0.5
+    max_dd_val = custom_params['max_drawdown'] if custom_params['max_drawdown'] else -15.0
+    min_ret_val = custom_params['min_return'] if custom_params['min_return'] else 3.0
+
+    if '--stock' in sys.argv:
+        fund_type = 'stock'
+        print(f"📊 分析数量: {max_funds} 只股票类基金")
+        print()
+
+        # 从全市场获取股票型基金池
+        fund_pool = get_stock_funds(max_funds=max_funds)
+    else:
+        print(f"📊 分析数量: {max_funds} 只基金")
+        print()
+
+        # 从全市场获取基金池（默认固收型）
+        fund_pool = get_all_gushou_funds(max_funds=max_funds)
     
     if len(fund_pool) == 0:
         print("\n❌ 未获取到基金数据")
@@ -803,8 +2138,8 @@ def main():
         print("\n❌ 未获取到有效数据")
         return
     
-    # 筛选优质基金（更严格的标准）
-    high_quality = filter_quality_funds(df, min_sharpe=0.5, max_drawdown=-15)
+    # 筛选优质基金
+    high_quality = filter_quality_funds(df, min_sharpe=min_sharpe_val, max_drawdown=max_dd_val, min_return=min_ret_val)
     
     # 保存结果
     output_file = "基金筛选结果.csv"
@@ -814,7 +2149,7 @@ def main():
     print("\n" + "=" * 120)
     print(" " * 50 + "🎉 筛选结果")
     print("=" * 120)
-    print(f"\n【分析 {len(df)} 只基金，{len(high_quality)} 只优质基金（夏普>=0.5 & 回撤<15%）】\n")
+    print(f"\n【分析 {len(df)} 只基金，{len(high_quality)} 只优质基金（夏普>={min_sharpe_val} & 回撤<{-max_dd_val}%）】\n")
     
     if len(high_quality) > 0:
         display_cols = ['基金代码', '基金名称', '类型', '夏普比率', '最大回撤(%)', 
@@ -823,7 +2158,7 @@ def main():
         print("-" * 120)
         print(high_quality[display_cols].head(20).to_string(index=False))
     else:
-        print("⚠️  未找到符合严格标准（夏普>=0.5 & 回撤<15%）的基金")
+        print(f"⚠️  未找到符合标准（夏普>={min_sharpe_val} & 回撤<{-max_dd_val}%）的基金")
         print("   建议放宽条件查看全部结果\n")
     
     print("\n\n📊 全部基金按夏普比率排序（TOP 30）：")
@@ -858,22 +2193,9 @@ def main():
     print(f"\n✅ 详细结果已保存到: {output_file}")
     print("\n💡 使用建议:")
     print("   • 优先关注夏普比率>0.5且回撤<15%的基金")
-    print("   • 可通过 'npx fund-screener <基金代码>' 进行单基金深度分析")
+    print("   • 可通过 'npx mutual-fund-skills <基金代码>' 进行单基金深度分析")
     print("=" * 120)
 
 
 if __name__ == "__main__":
-    import sys
-    
-    # 检查是否有命令行参数（单个基金分析模式）
-    if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
-        # 单个基金分析模式
-        fund_code = sys.argv[1]
-        fund_name = sys.argv[2] if len(sys.argv) > 2 else None
-        
-        print(f"正在分析基金: {fund_code}")
-        analysis = analyze_single_fund(fund_code, fund_name)
-        print_fund_analysis(analysis)
-    else:
-        # 批量筛选模式
-        main()
+    main()

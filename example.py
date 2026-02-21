@@ -5,7 +5,8 @@
 """
 
 import sys
-sys.path.insert(0, '/Users/sunxinyang/software/openclaw/.agents/skills/fund-screener')
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fund_screener import (
     get_fund_metrics,
