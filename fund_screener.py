@@ -23,6 +23,9 @@ METRICS_WINDOW_DAYS = 756
 # 共享缓存：fund_manager_em 数据（避免 get_fund_scale 和 get_fund_manager_info 各自独立请求）
 _manager_cache = {'data': None, 'time': 0}
 
+# 共享缓存：股票代码 → 申万行业映射
+_industry_cache = {'data': None, 'time': 0}
+
 
 def calculate_sharpe_ratio(returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE) -> float:
     """
@@ -309,13 +312,32 @@ def get_fund_metrics(fund_code: str, fund_name: str, min_days: int = 750) -> Opt
 def get_fund_scale(fund_code: str) -> Dict:
     """
     获取基金规模
-    
+
+    优先尝试获取单只基金规模，失败则回退到基金经理总管理规模（标注来源）。
+
     Args:
         fund_code: 基金代码
-    
+
     Returns:
         包含基金规模的字典
     """
+    # 方法1：尝试通过基金个体信息获取单只基金规模
+    try:
+        individual_df = ak.fund_individual_detail_info_xq(symbol=fund_code)
+        if individual_df is not None and len(individual_df) > 0:
+            for _, row in individual_df.iterrows():
+                item_name = str(row.iloc[0]) if len(row) > 0 else ''
+                item_value = str(row.iloc[1]) if len(row) > 1 else ''
+                if '规模' in item_name or '资产' in item_name:
+                    # 提取数字部分（如 "11.09亿" -> "11.09"）
+                    import re
+                    match = re.search(r'([\d.]+)', item_value)
+                    if match:
+                        return {'基金规模(亿元)': match.group(1)}
+    except Exception:
+        pass
+
+    # 方法2：回退到基金经理总管理规模
     try:
         import time as time_module
         if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
@@ -561,7 +583,7 @@ def get_fund_manager_info(fund_code: str) -> Dict:
 def get_fund_holding(fund_code: str) -> Dict:
     """获取基金持仓信息"""
     try:
-        hold_df = ak.fund_portfolio_hold_em(symbol=fund_code, date="")
+        hold_df = ak.fund_portfolio_hold_em(symbol=fund_code, date=str(datetime.now().year))
         if hold_df is not None and len(hold_df) > 0:
             latest_quarter = hold_df['季度'].iloc[0]
             latest_hold = hold_df[hold_df['季度'] == latest_quarter]
@@ -580,10 +602,261 @@ def get_fund_holding(fund_code: str) -> Dict:
     return {}
 
 
+def build_industry_mapping() -> Dict[str, str]:
+    """
+    构建股票代码 → 申万行业映射（带缓存）
+
+    遍历申万行业分类，获取每个行业的成分股，建立映射关系。
+    结果缓存到 _industry_cache，有效期 1 小时。
+
+    Returns:
+        {股票代码: 行业名称} 字典
+    """
+    import time as time_module
+
+    # 缓存有效期 1 小时
+    if _industry_cache['data'] is not None and time_module.time() - _industry_cache['time'] < 3600:
+        return _industry_cache['data']
+
+    print("  构建申万行业映射（首次执行，约20秒）...")
+    stock_to_industry = {}
+
+    try:
+        industry_df = ak.stock_board_industry_name_em()
+        industry_names = industry_df['板块名称'].tolist()
+
+        for idx, ind_name in enumerate(industry_names):
+            try:
+                cons = ak.stock_board_industry_cons_em(symbol=ind_name)
+                if cons is not None and len(cons) > 0:
+                    for _, row in cons.iterrows():
+                        stock_code = str(row.get('代码', ''))
+                        if stock_code:
+                            stock_to_industry[stock_code] = ind_name
+                if (idx + 1) % 50 == 0:
+                    print(f"    已处理 {idx+1}/{len(industry_names)} 个行业...")
+            except Exception:
+                pass
+            time.sleep(0.12)
+
+        print(f"  行业映射完成: {len(stock_to_industry)} 只股票")
+        _industry_cache['data'] = stock_to_industry
+        _industry_cache['time'] = time_module.time()
+    except Exception as e:
+        print(f"  行业映射构建失败: {e}")
+        _industry_cache['data'] = stock_to_industry
+        _industry_cache['time'] = time_module.time()
+
+    return stock_to_industry
+
+
+def get_fund_holdings_by_quarter(fund_code: str, years: List[str] = None) -> List[Dict]:
+    """
+    获取基金多个季度的持仓数据
+
+    Args:
+        fund_code: 基金代码
+        years: 年份列表，如 ['2024', '2023']
+
+    Returns:
+        [{'季度': str, '持仓': [{'股票代码': str, '股票名称': str, '占净值比例': float}]}]
+    """
+    if years is None:
+        current_year = datetime.now().year
+        years = [str(current_year), str(current_year - 1)]
+
+    quarters = []
+    for year in years:
+        try:
+            df = ak.fund_portfolio_hold_em(symbol=fund_code, date=year)
+            if df is not None and len(df) > 0:
+                for q_name in df['季度'].unique():
+                    q_df = df[df['季度'] == q_name].head(10)
+                    holdings = []
+                    for _, row in q_df.iterrows():
+                        pct = 0
+                        try:
+                            pct = float(str(row.get('占净值比例', 0)).replace('%', ''))
+                        except (ValueError, TypeError):
+                            pass
+                        holdings.append({
+                            '股票代码': str(row.get('股票代码', '')),
+                            '股票名称': str(row.get('股票名称', '')),
+                            '占净值比例': pct,
+                        })
+                    quarters.append({'季度': q_name, '持仓': holdings})
+        except Exception:
+            pass
+
+    return quarters
+
+
+def calculate_style_drift_from_holdings(quarters_data: List[Dict],
+                                         stock_to_industry: Dict[str, str]) -> Tuple[float, str]:
+    """
+    基于多季度持仓数据计算风格漂移分数
+
+    对每个季度的前10大持仓映射到行业，计算前3大行业在各季度之间的变化系数。
+
+    Args:
+        quarters_data: get_fund_holdings_by_quarter() 返回的季度持仓列表
+        stock_to_industry: 股票代码→行业映射
+
+    Returns:
+        (drift_score, drift_label)
+        drift_score: 0-1，越小越稳定
+        drift_label: "稳定"/"轻微漂移"/"严重漂移"
+    """
+    if len(quarters_data) < 3:
+        return 0.5, "数据不足"
+
+    # 计算每季度的行业权重分布
+    quarter_top3 = []
+    for q in quarters_data:
+        industry_weights = {}
+        for h in q['持仓']:
+            ind = stock_to_industry.get(h['股票代码'], '其他')
+            if ind not in industry_weights:
+                industry_weights[ind] = 0
+            industry_weights[ind] += h['占净值比例']
+
+        # 取前3大行业（不含"其他"）
+        sorted_ind = sorted(
+            [(k, v) for k, v in industry_weights.items() if k != '其他'],
+            key=lambda x: x[1], reverse=True
+        )[:3]
+        quarter_top3.append(set(k for k, v in sorted_ind))
+
+    if len(quarter_top3) < 3:
+        return 0.5, "数据不足"
+
+    # 方法：计算相邻季度之间 top3 行业的 Jaccard 相似度
+    similarities = []
+    for i in range(1, len(quarter_top3)):
+        if len(quarter_top3[i]) == 0 or len(quarter_top3[i-1]) == 0:
+            continue
+        intersection = len(quarter_top3[i] & quarter_top3[i-1])
+        union = len(quarter_top3[i] | quarter_top3[i-1])
+        if union > 0:
+            similarities.append(intersection / union)
+
+    if len(similarities) == 0:
+        return 0.5, "数据不足"
+
+    # 平均 Jaccard 相似度越高越稳定
+    avg_sim = np.mean(similarities)
+    drift_score = 1.0 - avg_sim  # 转换：相似度高→漂移分数低
+
+    if drift_score <= 0.3:
+        label = "稳定"
+    elif drift_score <= 0.5:
+        label = "轻微漂移"
+    else:
+        label = "严重漂移"
+
+    return round(drift_score, 2), label
+
+
+def classify_fund_style(holdings: List[Dict], stock_to_industry: Dict[str, str]) -> str:
+    """
+    根据持仓的行业分布，将基金分类为 价值/红利型、成长型 或 均衡型
+
+    Args:
+        holdings: 最近一期的前10大持仓
+        stock_to_industry: 股票代码→行业映射
+
+    Returns:
+        "价值/红利型" / "成长型" / "均衡型"
+    """
+    # 定义行业归属
+    # 注意：申万行业分类有一级/二级/三级，持仓数据中可能出现各级名称
+    value_industries = {
+        # 申万一级 — 典型价值/周期/资源板块
+        '银行', '煤炭', '石油石化', '电力', '交通运输', '钢铁', '房地产',
+        '建筑装饰', '建筑材料', '公用事业', '纺织服饰', '农林牧渔',
+        '有色金属', '基础化工', '环保', '综合',
+        # 申万二级/三级 — 资源/有色金属
+        '铜', '贵金属', '白银', '黄金', '工业金属', '小金属', '能源金属',
+        '磁性材料', '稀土', '铝', '锌', '铅', '锡', '镍', '钴', '锂',
+        '钨', '钼', '钛', '锰',
+        # 申万二级/三级 — 煤炭/石油
+        '焦煤', '动力煤', '焦炭', '油气开采', '油服工程', '炼油化工',
+        # 申万二级/三级 — 钢铁
+        '普钢', '特钢', '特钢Ⅱ',
+        # 申万二级/三级 — 电力/公用事业
+        '火电', '水电', '核电', '风电', '光伏发电', '热力',
+        # 申万二级/三级 — 交通运输
+        '铁路运输', '高速公路', '航运', '港口', '物流', '航空',
+        '公交', '机场',
+        # 申万二级/三级 — 银行
+        '国有大型银行Ⅲ', '股份制银行Ⅲ', '城商行Ⅲ', '农商行Ⅲ',
+        # 申万二级/三级 — 化工
+        '氟化工', '氯碱', '纯碱', '磷化工', '钾肥', '农药',
+        '涤纶', '粘胶', '氨纶', '碳纤维',
+        # 申万二级/三级 — 农林牧渔
+        '养殖业', '种植业', '饲料', '渔业', '林业', '动物保健',
+        # 申万二级/三级 — 其他价值/消费
+        '钟表珠宝', '轮胎轮毂', '综合Ⅱ', '纺织制造', '服装家纺',
+    }
+
+    growth_industries = {
+        # 申万一级 — 典型成长板块
+        '电子', '计算机', '医药生物', '电力设备', '通信', '传媒', '机械设备',
+        '国防军工', '汽车', '食品饮料', '美容护理', '家用电器',
+        # 申万二级/三级 — 半导体/电子
+        '半导体', '数字芯片设计', '集成电路制造', '集成电路封测',
+        '消费电子', '面板', '光学元件', '元件', '其他电子Ⅱ',
+        '模拟芯片设计', '存储', 'LED',
+        # 申万二级/三级 — 计算机/软件
+        'IT服务Ⅲ', '垂直应用软件', '通用应用软件', '基础软件',
+        # 申万二级/三级 — 通信
+        '通信网络设备及器件', '通信服务',
+        # 申万二级/三级 — 医药
+        '医疗器械', '化学制药', '化学制剂', '中药', '生物制品',
+        '医药商业', '医疗服务', '医疗耗材',
+        # 申万二级/三级 — 电力设备/新能源
+        '新能源动力系统', '光伏设备', '风电设备', '储能设备',
+        '电池', '逆变器',
+        # 申万二级/三级 — 家电
+        '白色家电', '空调', '小家电', '厨卫电器',
+        # 申万二级/三级 — 军工
+        '军工电子Ⅱ', '航空装备', '航天装备', '地面兵装',
+        # 申万二级/三级 — 机械
+        '专用设备', '通用设备', '工程机械', '自动化设备',
+    }
+
+    # 统计前5大行业中属于各类的数量
+    industry_weights = {}
+    for h in holdings[:10]:
+        ind = stock_to_industry.get(h['股票代码'], '其他')
+        if ind not in industry_weights:
+            industry_weights[ind] = 0
+        industry_weights[ind] += h['占净值比例']
+
+    sorted_ind = sorted(
+        [(k, v) for k, v in industry_weights.items() if k != '其他'],
+        key=lambda x: x[1], reverse=True
+    )[:5]
+
+    top_names = [k for k, v in sorted_ind]
+
+    value_count = sum(1 for name in top_names[:3]
+                      if any(vi in name for vi in value_industries))
+    growth_count = sum(1 for name in top_names[:3]
+                       if any(gi in name for gi in growth_industries))
+
+    if value_count >= 2:
+        return "价值/红利型"
+    elif growth_count >= 2:
+        return "成长型"
+    else:
+        return "均衡型"
+
+
 def analyze_single_fund(fund_code: str, fund_name: Optional[str] = None) -> Dict:
     """
     深度分析单个基金
-    
+
     Args:
         fund_code: 基金代码
         fund_name: 基金名称（可选，如果不提供会自动查找）
@@ -1155,6 +1428,310 @@ def get_gushou_plus_funds(max_funds: int = 0,
         ]
 
 
+def get_smart_active_funds(max_funds: int = 0,
+                           min_scale: float = 10.0,
+                           max_scale: float = 200.0,
+                           min_career_years: float = 5.0) -> List[Tuple[str, str, str]]:
+    """
+    智选主动管理基金 —— 选"每次考试都在前20%、且不偏科作弊"的基金
+
+    筛选策略（低成本指标初筛 → 全量深度分析）：
+    1. 基金类型精确匹配：股票型 / 混合型-偏股 / 混合型-灵活（排除一切指数型）
+    2. 规模筛选：默认 10-200 亿
+    3. 基金经理从业年限 ≥ 5 年（经历过至少一轮牛熊）
+    4. 业绩一致性检验：近1年/近2年/近3年 均需进入同类前40%/35%/30%
+    5. 按综合一致性得分排序输出
+
+    Args:
+        max_funds: 最大筛选数量（0=不限制）
+        min_scale: 最小规模（亿元，默认10）
+        max_scale: 最大规模（亿元，默认200）
+        min_career_years: 最低基金经理从业年限（默认5年）
+
+    Returns:
+        基金列表 [(代码, 名称, 类型), ...]
+    """
+    print("\n正在从全市场主动基金中智能筛选...")
+    print("-" * 100)
+
+    try:
+        # === Step 1：精确类型匹配，排除指数基金 ===
+        name_df = ak.fund_name_em()
+        active_types = ['股票型', '混合型-偏股', '混合型-灵活']
+        type_df = name_df[name_df['基金类型'].isin(active_types)][['基金代码', '基金简称', '基金类型']].copy()
+        print(f"✓ 主动管理型基金（股票型/偏股/灵活配置）: {len(type_df)} 只")
+
+        # === Step 2：规模筛选 ===
+        import time as time_module
+        if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
+            _manager_cache['data'] = ak.fund_manager_em()
+            _manager_cache['time'] = time_module.time()
+        mgr_df = _manager_cache['data']
+
+        mgr_unique = mgr_df.drop_duplicates(subset='现任基金代码', keep='first')[
+            ['现任基金代码', '现任基金资产总规模', '累计从业时间']
+        ].rename(columns={
+            '现任基金代码': '基金代码',
+            '现任基金资产总规模': '规模_亿',
+            '累计从业时间': '从业天数'
+        })
+
+        merged = type_df.merge(mgr_unique, on='基金代码', how='left')
+        scale_filtered = merged[
+            (merged['规模_亿'] >= min_scale) & (merged['规模_亿'] <= max_scale)
+        ].copy()
+        print(f"✓ 规模 {min_scale}-{max_scale} 亿筛选后: {len(scale_filtered)} 只")
+
+        # === Step 3：基金经理从业年限筛选 ===
+        min_career_days = min_career_years * 365
+        career_filtered = scale_filtered[
+            scale_filtered['从业天数'].notna() &
+            (scale_filtered['从业天数'] >= min_career_days)
+        ].copy()
+        print(f"✓ 经理从业 ≥{min_career_years}年 筛选后: {len(career_filtered)} 只")
+
+        # === Step 4：业绩一致性检验 ===
+        rank_df = ak.fund_open_fund_rank_em()
+        rank_df['近1年'] = pd.to_numeric(rank_df['近1年'], errors='coerce')
+        rank_df['近2年'] = pd.to_numeric(rank_df['近2年'], errors='coerce')
+        rank_df['近3年'] = pd.to_numeric(rank_df['近3年'], errors='coerce')
+        rank_cols = rank_df[['基金代码', '近1年', '近2年', '近3年']].copy()
+
+        result_df = career_filtered.merge(rank_cols, on='基金代码', how='left')
+
+        # 必须成立满3年
+        result_df = result_df[result_df['近3年'].notna()].copy()
+        print(f"✓ 成立满3年: {len(result_df)} 只")
+
+        # 分类型计算百分位排名（在同类型基金中比较）
+        # 百分位越低越好：0% = 最好，100% = 最差
+        for period in ['近1年', '近2年', '近3年']:
+            result_df[f'{period}_pct'] = result_df.groupby('基金类型')[period].rank(
+                method='min', ascending=False, pct=True
+            )
+
+        # 一致性要求：每个时期都在同类前N%
+        consistent = result_df[
+            (result_df['近1年_pct'] <= 0.40) &   # 近1年前40%
+            (result_df['近2年_pct'] <= 0.35) &   # 近2年前35%
+            (result_df['近3年_pct'] <= 0.30)     # 近3年前30%
+        ].copy()
+        print(f"✓ 业绩一致性检验（1Y前40%+2Y前35%+3Y前30%）: {len(consistent)} 只")
+
+        if len(consistent) == 0:
+            print("  放宽条件重试...")
+            consistent = result_df[
+                (result_df['近1年_pct'] <= 0.50) &
+                (result_df['近2年_pct'] <= 0.45) &
+                (result_df['近3年_pct'] <= 0.40)
+            ].copy()
+            print(f"  放宽后: {len(consistent)} 只")
+
+        # === Step 5：综合得分排序 ===
+        # 得分越低越好（百分位排名越靠前）
+        consistent['综合得分'] = (
+            0.4 * consistent['近3年_pct'] +
+            0.3 * consistent['近2年_pct'] +
+            0.3 * consistent['近1年_pct']
+        )
+        consistent = consistent.sort_values('综合得分', ascending=True)
+
+        if max_funds > 0:
+            selected = consistent.head(max_funds)
+        else:
+            selected = consistent
+
+        print(f"✓ 按一致性综合得分排序，共 {len(selected)} 只将进行深度分析\n")
+
+        # 各类型分布
+        for t in active_types:
+            cnt = len(selected[selected['基金类型'] == t])
+            if cnt > 0:
+                print(f"  {t}: {cnt} 只")
+
+        # === 转换为输出格式 ===
+        type_map = {
+            '股票型': '股票型',
+            '混合型-偏股': '偏股混合',
+            '混合型-灵活': '灵活配置',
+        }
+
+        result = []
+        for _, row in selected.iterrows():
+            code = str(row['基金代码']).zfill(6)
+            name = row['基金简称']
+            ftype = type_map.get(row['基金类型'], '主动管理')
+            result.append((code, name, ftype))
+
+        return result
+
+    except Exception as e:
+        print(f"✗ 获取基金列表失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def get_dividend_funds(min_scale: float = 5.0,
+                       max_scale: float = 500.0,
+                       min_career_years: float = 3.0) -> List[Tuple[str, str, str]]:
+    """
+    筛选重仓红利/高股息的主动管理型基金
+
+    双通道筛选：
+    通道A: 名称包含红利/高股息/价值等关键词的基金（直接入池）
+    通道B: 全量主动基金中，通过持仓分析确认重仓高股息板块的
+
+    放宽标准：规模5-500亿，经理从业≥3年，业绩一致性放宽
+
+    Returns:
+        [(代码, 名称, 类型), ...]
+    """
+    try:
+        print("\n正在从全市场筛选红利/高股息主动基金...")
+        print("-" * 100)
+
+        # Step 1: 获取全量基金名称和类型
+        name_df = ak.fund_name_em()
+
+        # 只要主动管理的类型
+        active_types = ['股票型', '混合型-偏股', '混合型-灵活']
+        exclude_types = ['指数型-股票', '指数型-海外股票', '指数型-固收', '指数型-其他']
+        type_df = name_df[name_df['基金类型'].isin(active_types)].copy()
+        # 排除名称中含指数特征的
+        idx_kw = ['指数', 'ETF', 'LOF联接', '被动', '跟踪', '增强指数']
+        for kw in idx_kw:
+            type_df = type_df[~type_df['基金简称'].str.contains(kw, na=False)]
+        print(f"✓ 主动管理型基金（股票型/偏股/灵活配置）: {len(type_df)} 只")
+
+        # Step 2: 标记红利关键词基金（通道A）
+        dividend_keywords = ['红利', '高股息', '股息', '价值精选', '央企回报', '国企红利',
+                           '高分红', '低估值', '深度价值', '价值回报', '红利低波',
+                           '红利优选', '红利增长', '红利策略']
+        type_df['is_dividend_name'] = False
+        for kw in dividend_keywords:
+            type_df.loc[type_df['基金简称'].str.contains(kw, na=False), 'is_dividend_name'] = True
+
+        dividend_name_count = type_df['is_dividend_name'].sum()
+        print(f"  其中名称含红利/高股息关键词: {dividend_name_count} 只")
+
+        # Step 3: 规模筛选（放宽到 5-500 亿）
+        import time as time_module
+        if _manager_cache['data'] is None or time_module.time() - _manager_cache['time'] > 600:
+            _manager_cache['data'] = ak.fund_manager_em()
+            _manager_cache['time'] = time_module.time()
+        mgr_df = _manager_cache['data']
+
+        # 构建经理数据（统一列名）
+        mgr_unique = mgr_df.drop_duplicates(subset='现任基金代码', keep='first')[
+            ['现任基金代码', '现任基金资产总规模', '累计从业时间']
+        ].rename(columns={
+            '现任基金代码': '基金代码',
+            '现任基金资产总规模': '规模_亿',
+            '累计从业时间': '从业天数'
+        })
+        mgr_unique['规模_亿'] = pd.to_numeric(mgr_unique['规模_亿'], errors='coerce')
+        mgr_unique['从业天数'] = pd.to_numeric(mgr_unique['从业天数'], errors='coerce')
+
+        merged = type_df.merge(mgr_unique, on='基金代码', how='left')
+        merged = merged[
+            (merged['规模_亿'] >= min_scale) & (merged['规模_亿'] <= max_scale)
+        ].copy()
+        print(f"✓ 规模 {min_scale}-{max_scale} 亿筛选后: {len(merged)} 只")
+
+        # Step 4: 经理从业年限 ≥ 3年（放宽）
+        min_career_days = min_career_years * 365
+        merged = merged[
+            merged['从业天数'].notna() & (merged['从业天数'] >= min_career_days)
+        ].copy()
+        print(f"✓ 经理从业 ≥{min_career_years}年 筛选后: {len(merged)} 只")
+
+        # Step 5: 业绩排名检验（放宽：只要求近3年有数据 + 近1年前60%）
+        rank_df = ak.fund_open_fund_rank_em()
+
+        if '近1年' in rank_df.columns:
+            for col in ['近1年', '近2年', '近3年']:
+                if col in rank_df.columns:
+                    rank_df[col] = pd.to_numeric(rank_df[col], errors='coerce')
+
+            rank_df = rank_df[rank_df['基金代码'].isin(merged['基金代码'])]
+
+            # 分通道处理
+            # 通道A（名称匹配）: 只要求近1年收益为正
+            dividend_codes = set(merged[merged['is_dividend_name'] == True]['基金代码'])
+            rank_a = rank_df[rank_df['基金代码'].isin(dividend_codes)].copy()
+            if '近1年' in rank_a.columns:
+                rank_a = rank_a[rank_a['近1年'] > 0]  # 只要求正收益
+
+            # 通道B（非名称匹配）: 放宽的一致性检验
+            rank_b = rank_df[~rank_df['基金代码'].isin(dividend_codes)].copy()
+
+            # 要求近3年有数据
+            if '近3年' in rank_b.columns:
+                rank_b = rank_b.dropna(subset=['近3年'])
+
+            # 按同类型计算百分位排名
+            if '基金类型' in merged.columns:
+                rank_b = rank_b.merge(
+                    merged[['基金代码', '基金类型']].drop_duplicates(),
+                    on='基金代码', how='left'
+                )
+            else:
+                rank_b['基金类型'] = '混合型'
+
+            for col in ['近1年', '近2年', '近3年']:
+                if col in rank_b.columns:
+                    rank_b[f'{col}_pct'] = rank_b.groupby('基金类型')[col].rank(
+                        pct=True, ascending=False
+                    )
+
+            # 放宽条件: 近1年前60%, 近2年前55%, 近3年前50%
+            if '近1年_pct' in rank_b.columns:
+                rank_b = rank_b[rank_b['近1年_pct'] <= 0.60]
+            if '近2年_pct' in rank_b.columns:
+                rank_b = rank_b[rank_b['近2年_pct'] <= 0.55]
+            if '近3年_pct' in rank_b.columns:
+                rank_b = rank_b[rank_b['近3年_pct'] <= 0.50]
+
+            passed_codes = set(rank_a['基金代码'].tolist() + rank_b['基金代码'].tolist())
+            merged = merged[merged['基金代码'].isin(passed_codes)]
+
+        print(f"✓ 业绩筛选后: {len(merged)} 只（通道A名称匹配 + 通道B放宽一致性）")
+
+        # Step 6: 综合排序
+        # 通道A优先（名称匹配的红利基金排在前面），然后按规模降序
+        merged['channel'] = merged['is_dividend_name'].apply(lambda x: 0 if x else 1)
+        merged = merged.sort_values(['channel', '规模_亿'], ascending=[True, False])
+
+        # 构建输出
+        type_map = {
+            '股票型': '股票型',
+            '混合型-偏股': '偏股混合',
+            '混合型-灵活': '灵活配置',
+        }
+
+        result = []
+        for _, row in merged.iterrows():
+            code = str(row['基金代码']).zfill(6)
+            name = str(row['基金简称'])
+            fund_type = type_map.get(str(row.get('基金类型', '')), '混合型')
+            result.append((code, name, fund_type))
+
+        a_count = len(merged[merged['is_dividend_name'] == True])
+        b_count = len(merged[merged['is_dividend_name'] == False])
+        print(f"✓ 共 {len(result)} 只候选")
+        print(f"  通道A（名称匹配红利/高股息）: {a_count} 只")
+        print(f"  通道B（全量筛选待持仓验证）: {b_count} 只")
+
+        return result
+
+    except Exception as e:
+        print(f"\n筛选出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 def get_all_gushou_funds(max_funds: int = 200) -> List[Tuple[str, str, str]]:
     """
     从所有基金中智能筛选优质基金
@@ -1689,8 +2266,149 @@ def analyze_stock_funds_advanced(fund_list: List[Tuple[str, str, str]],
     # 按卡玛比率排序
     if '卡玛比率' in df.columns:
         df = df.sort_values('卡玛比率', ascending=False)
-    
+
     return df
+
+
+def analyze_smart_funds_advanced(fund_pool: List[Tuple[str, str, str]],
+                                  delay: float = 0.3) -> pd.DataFrame:
+    """
+    智选主动基金深度分析 —— 在常规指标之上增加风格漂移检测和哑铃分类
+
+    对每只基金：
+    1. 计算 Sharpe/Sortino/MaxDD/AnnualReturn/Calmar（3年窗口）
+    2. 获取近2年持仓，检测风格漂移
+    3. 根据持仓行业分布进行 价值/红利 vs 成长 分类
+
+    Args:
+        fund_pool: [(代码, 名称, 类型), ...]
+        delay: API 调用间隔秒数
+
+    Returns:
+        DataFrame，包含所有指标 + 风格漂移分数 + 哑铃分类 + 重点板块
+    """
+    if not fund_pool:
+        return pd.DataFrame()
+
+    total = len(fund_pool)
+    print(f"\n开始深度分析 {total} 只主动基金（含风格漂移检测）...\n")
+
+    # 预构建行业映射
+    stock_to_industry = build_industry_mapping()
+
+    results = []
+
+    for idx, (code, name, ftype) in enumerate(fund_pool):
+        print(f"[{idx+1:>3}/{total}] {code} {name} ... ", end="", flush=True)
+
+        try:
+            # === Part 1: 常规指标计算 ===
+            df = ak.fund_open_fund_info_em(symbol=code, indicator="单位净值走势")
+
+            if df is None or len(df) < 750:
+                print("✗ 数据不足")
+                continue
+
+            df['净值日期'] = pd.to_datetime(df['净值日期'])
+            df = df.sort_values('净值日期')
+            df['日收益率'] = df['单位净值'].pct_change()
+
+            window_df = df.tail(METRICS_WINDOW_DAYS)
+            returns = window_df['日收益率'].dropna()
+
+            sharpe = calculate_sharpe_ratio(returns)
+            sortino = calculate_sortino_ratio(returns)
+            max_dd = calculate_max_drawdown(window_df['单位净值'])
+            annual_return = calculate_annualized_return(window_df['单位净值'])
+            calmar = calculate_calmar_ratio(annual_return, max_dd)
+
+            return_1y = _calc_period_return(df, 1)
+
+            # 获取基金规模
+            scale_info = get_fund_scale(code)
+
+            # 获取基金经理信息
+            mgr_info = get_fund_manager_info(code)
+
+            # === Part 2: 风格漂移检测 ===
+            quarters_data = get_fund_holdings_by_quarter(code, years=['2024', '2023'])
+            drift_score, drift_label = calculate_style_drift_from_holdings(
+                quarters_data, stock_to_industry
+            )
+
+            # === Part 3: 哑铃分类 + 重点板块 ===
+            style_class = "均衡型"
+            top_sectors_str = ""
+
+            if quarters_data and quarters_data[0]['持仓']:
+                latest_holdings = quarters_data[0]['持仓']
+                style_class = classify_fund_style(latest_holdings, stock_to_industry)
+
+                # 计算重点板块
+                industry_weights = {}
+                for h in latest_holdings[:10]:
+                    ind = stock_to_industry.get(h['股票代码'], '其他')
+                    if ind != '其他':
+                        if ind not in industry_weights:
+                            industry_weights[ind] = 0
+                        industry_weights[ind] += h['占净值比例']
+
+                sorted_ind = sorted(industry_weights.items(), key=lambda x: x[1], reverse=True)[:3]
+                top_sectors_str = ', '.join(f"{k}({v:.1f}%)" for k, v in sorted_ind)
+
+                # 前5大持仓名称
+                top_names = ', '.join(h['股票名称'] for h in latest_holdings[:5])
+            else:
+                top_names = ""
+
+            metrics = {
+                '基金代码': code,
+                '基金名称': name,
+                '类型': ftype,
+                '风格分类': style_class,
+                '基金经理': mgr_info.get('基金经理', ''),
+                '从业年限': mgr_info.get('从业年限', ''),
+                '夏普比率': round(sharpe, 2) if not np.isnan(sharpe) else None,
+                '索提诺比率': round(sortino, 2) if not np.isnan(sortino) else None,
+                '卡玛比率': round(calmar, 2) if not np.isnan(calmar) else None,
+                '最大回撤(%)': round(max_dd * 100, 2) if not np.isnan(max_dd) else None,
+                '年化收益率(%)': round(annual_return * 100, 2) if not np.isnan(annual_return) else None,
+                '近1年收益(%)': round(return_1y, 2) if return_1y is not None else None,
+                '风格漂移': drift_score,
+                '风格稳定度': drift_label,
+                '重点板块': top_sectors_str,
+                '前5大持仓': top_names,
+                **scale_info,
+            }
+
+            results.append(metrics)
+
+            calmar_str = f"{calmar:.2f}" if not np.isnan(calmar) else "N/A"
+            dd_str = f"{max_dd*100:.1f}" if not np.isnan(max_dd) else "N/A"
+            print(f"✓ [{style_class}] 卡玛:{calmar_str} 回撤:{dd_str}% 漂移:{drift_label}")
+
+        except Exception as e:
+            print(f"✗ 错误: {str(e)[:40]}")
+
+        time.sleep(delay)
+
+    if not results:
+        return pd.DataFrame()
+
+    result_df = pd.DataFrame(results)
+
+    # 剔除严重漂移的基金
+    before_count = len(result_df)
+    result_df = result_df[result_df['风格漂移'] <= 0.5].copy()
+    removed = before_count - len(result_df)
+    if removed > 0:
+        print(f"\n已剔除 {removed} 只风格严重漂移的基金")
+
+    # 按卡玛比率排序
+    if '卡玛比率' in result_df.columns:
+        result_df = result_df.sort_values('卡玛比率', ascending=False)
+
+    return result_df
 
 
 def main():
@@ -1768,6 +2486,260 @@ def main():
             except ValueError:
                 pass
     
+    # 检查是否使用红利/高股息基金筛选
+    if '--dividend' in sys.argv:
+        fund_type = 'dividend'
+
+        print("\n" + "=" * 120)
+        print(" " * 30 + "重仓红利/高股息主动基金筛选")
+        print(" " * 20 + "寻找重仓银行、煤炭、电力、交运等高股息板块的基金")
+        print("=" * 120)
+        print("筛选理念：")
+        print("  • 排除指数基金，只选主动管理")
+        print("  • 双通道筛选：名称关键词匹配 + 全量持仓验证")
+        print("  • 放宽标准：规模5-500亿，经理从业≥3年")
+        print("  • 风格漂移检测，保留风格稳定的基金")
+        print("  • 只保留持仓确认为高股息板块的基金")
+        print("=" * 120)
+
+        # 筛选候选基金
+        fund_pool = get_dividend_funds()
+
+        if not fund_pool:
+            print("\n未获取到基金数据")
+            return
+
+        # 去重
+        seen = set()
+        unique_funds = []
+        for fund in fund_pool:
+            if fund[0] not in seen:
+                seen.add(fund[0])
+                unique_funds.append(fund)
+
+        # 限制深度分析数量
+        max_analyze = 200
+        if len(unique_funds) > max_analyze:
+            print(f"\n候选 {len(unique_funds)} 只，取前{max_analyze}只进行深度分析")
+            unique_funds = unique_funds[:max_analyze]
+
+        print(f"\n实际分析 {len(unique_funds)} 只基金\n")
+
+        # 深度分析（含风格漂移检测 + 行业分类）
+        df = analyze_smart_funds_advanced(unique_funds)
+
+        if len(df) == 0:
+            print("\n未获取到有效数据")
+            return
+
+        # 只保留 价值/红利型 的基金
+        dividend_df = df[df['风格分类'] == '价值/红利型'].copy()
+
+        # 定义纯红利/高股息的行业关键词（排除黄金、有色等资源周期）
+        pure_dividend_kw = ['银行', '煤炭', '电力', '石油', '交通', '钢铁', '房地产',
+                           '建筑', '公用事业', '火电', '水电', '核电', '高速公路',
+                           '铁路', '航运', '港口']
+
+        # 对每只基金检查重点板块是否以纯高股息行业为主
+        def is_pure_dividend(row):
+            """检查基金重点板块是否以纯高股息行业为主"""
+            boards = str(row.get('重点板块', ''))
+            if not boards:
+                return False
+            # 宽松判断：只要重点板块中至少有一个纯高股息行业就保留
+            for kw in pure_dividend_kw:
+                if kw in boards:
+                    return True
+            return False
+
+        # 分两组：纯高股息 和 资源价值型
+        pure_div = dividend_df[dividend_df.apply(is_pure_dividend, axis=1)].copy()
+        resource_div = dividend_df[~dividend_df.apply(is_pure_dividend, axis=1)].copy()
+
+        # 其他分类中名称含红利的也捞回来
+        other_df = df[df['风格分类'] != '价值/红利型'].copy()
+        name_rescued = other_df[other_df['基金名称'].apply(
+            lambda x: any(kw in str(x) for kw in ['红利', '高股息', '股息', '价值'])
+        )].copy()
+
+        # 合并最终结果
+        all_dividend = pd.concat([pure_div, resource_div, name_rescued], ignore_index=True)
+        # 按卡玛比率降序
+        all_dividend = all_dividend.sort_values('卡玛比率', ascending=False)
+
+        # 保存CSV
+        output_file = "红利高股息基金精选.csv"
+        all_dividend.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+        # === 输出结果 ===
+        print("\n" + "=" * 120)
+        print(" " * 40 + "红利/高股息基金筛选结果")
+        print("=" * 120)
+        print(f"\n共分析 {len(unique_funds)} 只，{len(df)} 只通过风格漂移检验")
+        print(f"其中红利/高股息相关: {len(all_dividend)} 只\n")
+
+        display_cols = ['基金代码', '基金名称', '基金经理', '从业年限',
+                       '卡玛比率', '夏普比率', '最大回撤(%)', '年化收益率(%)',
+                       '近1年收益(%)', '风格稳定度', '重点板块']
+
+        # 纯高股息板块基金
+        if len(pure_div) > 0:
+            print("\n" + "=" * 120)
+            print(" " * 25 + "纯高股息板块基金（银行/煤电/交运/建筑等）")
+            print("=" * 120)
+            print(f"共 {len(pure_div)} 只\n")
+            avail_cols = [c for c in display_cols if c in pure_div.columns]
+            print(pure_div[avail_cols].to_string(index=False))
+
+        # 资源价值型基金
+        if len(resource_div) > 0:
+            print("\n\n" + "=" * 120)
+            print(" " * 25 + "资源价值型基金（贵金属/有色/化工等）")
+            print("=" * 120)
+            print(f"共 {len(resource_div)} 只\n")
+            avail_cols = [c for c in display_cols if c in resource_div.columns]
+            print(resource_div[avail_cols].to_string(index=False))
+
+        # 名称含红利但持仓偏成长的
+        if len(name_rescued) > 0:
+            print("\n\n" + "=" * 120)
+            print(" " * 25 + "名称含红利/价值但持仓偏其他风格")
+            print("=" * 120)
+            print(f"共 {len(name_rescued)} 只\n")
+            avail_cols = [c for c in display_cols if c in name_rescued.columns]
+            print(name_rescued[avail_cols].to_string(index=False))
+
+        # 统计摘要
+        print("\n\n" + "=" * 120)
+        print(" " * 50 + "统计摘要")
+        print("=" * 120)
+        print(f"通过筛选基金总数: {len(all_dividend)}")
+        if len(pure_div) > 0:
+            print(f"  纯高股息板块: {len(pure_div)} 只")
+        if len(resource_div) > 0:
+            print(f"  资源价值型: {len(resource_div)} 只")
+        if len(name_rescued) > 0:
+            print(f"  名称含红利/持仓偏其他: {len(name_rescued)} 只")
+        if len(all_dividend) > 0:
+            print(f"卡玛比率: 均值 {all_dividend['卡玛比率'].mean():.2f}, 中位数 {all_dividend['卡玛比率'].median():.2f}")
+            print(f"最大回撤: 均值 {all_dividend['最大回撤(%)'].mean():.1f}%, 中位数 {all_dividend['最大回撤(%)'].median():.1f}%")
+            if '近1年收益(%)' in all_dividend.columns:
+                print(f"近1年收益: 均值 {all_dividend['近1年收益(%)'].mean():.1f}%, 中位数 {all_dividend['近1年收益(%)'].median():.1f}%")
+
+        print(f"\n结果已保存: {output_file}")
+
+        return
+
+    # 检查是否使用智选主动基金筛选
+    if '--smart-pick' in sys.argv:
+        fund_type = 'smart_pick'
+
+        print("\n" + "=" * 120)
+        print(" " * 30 + "智选主动基金 —— 哑铃结构配置")
+        print(" " * 20 + "选'每次考试都在前20%、且绝对不偏科作弊'的基金")
+        print("=" * 120)
+        print("筛选理念：")
+        print("  • 排除指数基金，只选主动管理")
+        print("  • 基金经理从业 ≥5年，经历过牛熊考验")
+        print("  • 近1年/2年/3年业绩一致性检验，拒绝'一次性考第一'")
+        print("  • 风格漂移检测，剔除'挂羊头卖狗肉'的基金")
+        print("  • 自动分类：价值/红利型 + 成长型 → 哑铃结构")
+        print("=" * 120)
+        print()
+
+        # 获取智选基金池
+        fund_pool = get_smart_active_funds()
+
+        if len(fund_pool) == 0:
+            print("\n未获取到基金数据")
+            return
+
+        # 去重
+        seen = set()
+        unique_funds = []
+        for fund in fund_pool:
+            if fund[0] not in seen:
+                seen.add(fund[0])
+                unique_funds.append(fund)
+
+        # 限制深度分析数量（默认最多150只）
+        if len(unique_funds) > 150:
+            print(f"\n候选 {len(unique_funds)} 只，取综合得分最优的150只进行深度分析")
+            unique_funds = unique_funds[:150]
+
+        print(f"\n实际分析 {len(unique_funds)} 只基金\n")
+
+        # 深度分析（含风格漂移检测 + 哑铃分类）
+        df = analyze_smart_funds_advanced(unique_funds)
+
+        if len(df) == 0:
+            print("\n未获取到有效数据")
+            return
+
+        # 保存CSV
+        output_file = "智选主动基金精选.csv"
+        df.to_csv(output_file, index=False, encoding='utf-8-sig')
+
+        # === 按哑铃结构分组输出 ===
+        print("\n" + "=" * 120)
+        print(" " * 40 + "智选主动基金筛选结果")
+        print("=" * 120)
+        print(f"\n共分析 {len(unique_funds)} 只，{len(df)} 只通过风格漂移检验\n")
+
+        display_cols = ['基金代码', '基金名称', '基金经理', '从业年限',
+                       '卡玛比率', '夏普比率', '最大回撤(%)', '年化收益率(%)',
+                       '风格稳定度', '重点板块']
+
+        # 价值/红利型
+        value_df = df[df['风格分类'] == '价值/红利型'].copy()
+        if len(value_df) > 0:
+            print("\n" + "=" * 120)
+            print(" " * 30 + "价值/红利型精选（对冲科技行业周期风险）")
+            print("=" * 120)
+            print(f"共 {len(value_df)} 只\n")
+            avail_cols = [c for c in display_cols if c in value_df.columns]
+            print(value_df[avail_cols].head(25).to_string(index=False))
+
+        # 成长型
+        growth_df = df[df['风格分类'] == '成长型'].copy()
+        if len(growth_df) > 0:
+            print("\n\n" + "=" * 120)
+            print(" " * 30 + "高质量成长型精选（博取超额收益）")
+            print("=" * 120)
+            print(f"共 {len(growth_df)} 只\n")
+            avail_cols = [c for c in display_cols if c in growth_df.columns]
+            print(growth_df[avail_cols].head(25).to_string(index=False))
+
+        # 均衡型
+        balanced_df = df[df['风格分类'] == '均衡型'].copy()
+        if len(balanced_df) > 0:
+            print("\n\n" + "=" * 120)
+            print(" " * 40 + "均衡型精选")
+            print("=" * 120)
+            print(f"共 {len(balanced_df)} 只\n")
+            avail_cols = [c for c in display_cols if c in balanced_df.columns]
+            print(balanced_df[avail_cols].head(15).to_string(index=False))
+
+        # 统计摘要
+        print("\n\n" + "=" * 120)
+        print(" " * 50 + "统计摘要")
+        print("=" * 120)
+        print(f"通过筛选基金总数: {len(df)}")
+        print(f"  价值/红利型: {len(value_df)} 只")
+        print(f"  成长型: {len(growth_df)} 只")
+        print(f"  均衡型: {len(balanced_df)} 只")
+        if '卡玛比率' in df.columns:
+            valid_calmar = df['卡玛比率'].dropna()
+            if len(valid_calmar) > 0:
+                print(f"卡玛比率: 均值 {valid_calmar.mean():.2f}, 中位数 {valid_calmar.median():.2f}")
+        if '最大回撤(%)' in df.columns:
+            valid_dd = df['最大回撤(%)'].dropna()
+            if len(valid_dd) > 0:
+                print(f"最大回撤: 均值 {valid_dd.mean():.1f}%, 中位数 {valid_dd.median():.1f}%")
+        print(f"\n结果已保存: {output_file}")
+
+        return
+
     # 检查是否使用专业股票型基金筛选
     if '--stock-alpha' in sys.argv:
         fund_type = 'stock_alpha'

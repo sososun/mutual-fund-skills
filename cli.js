@@ -243,7 +243,7 @@ if (args.length > 0 && !args[0].startsWith('--')) {
     }
 
     // 透传开关参数
-    const flagArgs = ['--gushou-plus', '--stock', '--stock-alpha', '--bond', '--pure-bond'];
+    const flagArgs = ['--gushou-plus', '--stock', '--stock-alpha', '--smart-pick', '--dividend', '--bond', '--pure-bond'];
     for (const flag of flagArgs) {
       if (args.includes(flag)) {
         pythonArgs.push(flag);
@@ -255,6 +255,10 @@ if (args.length > 0 && !args[0].startsWith('--')) {
       console.log(`${colors.yellow}启动纯债基金筛选...${colors.reset}\n`);
     } else if (args.includes('--gushou-plus')) {
       console.log(`${colors.yellow}启动固收+基金专业筛选...${colors.reset}\n`);
+    } else if (args.includes('--dividend')) {
+      console.log(`${colors.yellow}启动红利/高股息基金筛选...${colors.reset}\n`);
+    } else if (args.includes('--smart-pick')) {
+      console.log(`${colors.yellow}启动智选主动基金筛选（哑铃结构）...${colors.reset}\n`);
     } else if (args.includes('--stock-alpha')) {
       console.log(`${colors.yellow}启动专业Alpha策略筛选...${colors.reset}\n`);
     } else if (args.includes('--stock')) {
